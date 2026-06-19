@@ -1,5 +1,3 @@
-#include "glm.hpp"
-
 #include "ardugl.h"
 #include "glm.hpp"
 
