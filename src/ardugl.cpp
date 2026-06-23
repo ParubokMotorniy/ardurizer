@@ -2,11 +2,12 @@
 
 #include "glm.hpp"
 
+#include <cstring>
 #include <vector>
 
 struct Buffer
 {
-    const char *buffPtr = nullptr;
+    char *buffPtr = nullptr;
     int buffSize = 0;
     int itemSize = 0;
 };
@@ -28,7 +29,26 @@ Buffer colorBuffer;
 Buffer depthBuffer;
 AABB renderTargetDimensions;
 
-ArduGL::ReturnInfo ArduGL::bindBuffer(BufferType buffType, const char *buffPtr, int buffSize,
+ArduGL::ReturnInfo ArduGL::clearBuffer(BufferType buffType, char clearValue)
+{
+    switch (buffType)
+    {
+    case BufferType::BT_VertexAttribute:
+    case BufferType::BT_VertexIndex:
+        return ReturnInfo{ false, EC_InvalidOperation };
+    case BufferType::BT_Depth:
+        std::memset(depthBuffer.buffPtr, clearValue, depthBuffer.buffSize);
+        break;
+    case BufferType::BT_Color:
+        std::memset(colorBuffer.buffPtr, clearValue, colorBuffer.buffSize);
+        break;
+    default:
+        return ReturnInfo{ false, EC_UnsupportedBufferType };
+    }
+    return ReturnInfo{ true, EC_OK };
+}
+
+ArduGL::ReturnInfo ArduGL::bindBuffer(BufferType buffType, char *buffPtr, int buffSize,
                                       int itemSize)
 {
     switch (buffType)
@@ -127,6 +147,12 @@ ArduGL::ReturnInfo ArduGL::unbindShader(ShaderType shType)
 
 void perspectiveDivide(glm::vec4 &clipPos) { clipPos /= clipPos.w; }
 
+void rescaleZ(glm::vec4 &ndcPos)
+{
+    ndcPos.z += 1.0;
+    ndcPos.z /= 2.0;
+}
+
 void mapToScreen(glm::vec4 &ndcPos)
 {
     // shifts the viewport (not configurable)
@@ -165,7 +191,7 @@ std::vector<glm::vec2> rasterizeTriangle(const AABB &triangleAABB, const glm::ve
     const glm::vec3 v2Pos{ v2.x, v2.y, 0 };
     const glm::vec3 v3Pos{ v3.x, v3.y, 0 };
 
-    std::vector<glm::vec2> coveredPixels; // TODO: I believe this can be optimized
+    std::vector<glm::vec2> coveredFragments; // TODO: I believe this can be optimized
 
     for (int x = glm::ceil(triangleAABB.blX), xMax = triangleAABB.blX + triangleAABB.width;
          x < xMax; ++x)
@@ -173,14 +199,14 @@ std::vector<glm::vec2> rasterizeTriangle(const AABB &triangleAABB, const glm::ve
         for (int y = glm::ceil(triangleAABB.blY), yMax = triangleAABB.blY + triangleAABB.height;
              y < yMax; ++y)
         {
-            const glm::vec3 pixelCoordinates{ x, y, 0.0 };
+            const glm::vec3 fragmentCoordinates{ x, y, 0.0 };
 
             const bool pixelCenterIsCovered
-                = glm::cross(pixelCoordinates - v1Pos, v2Pos - v1Pos).z >= 0.0
-                  && glm::cross(pixelCoordinates - v2Pos, v3Pos - v2Pos).z >= 0.0
-                  && glm::cross(pixelCoordinates - v3Pos, v1Pos - v3Pos).z >= 0.0;
+                = glm::cross(fragmentCoordinates - v1Pos, v2Pos - v1Pos).z >= 0.0
+                  && glm::cross(fragmentCoordinates - v2Pos, v3Pos - v2Pos).z >= 0.0
+                  && glm::cross(fragmentCoordinates - v3Pos, v1Pos - v3Pos).z >= 0.0;
             if (pixelCenterIsCovered)
-                coveredPixels.push_back(pixelCoordinates);
+                coveredFragments.emplace_back(x, y);
         }
     }
 }
@@ -226,6 +252,11 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         assert(static_cast<int>(renderTargetDimensions.width * renderTargetDimensions.height)
                == (colorBuffer.buffSize / colorBuffer.itemSize));
 
+        // shift z
+        rescaleZ(tv1.first);
+        rescaleZ(tv2.first);
+        rescaleZ(tv3.first);
+
         // screen mapping
         mapToScreen(tv1.first);
         mapToScreen(tv2.first);
@@ -233,19 +264,59 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
 
         const AABB triangleAABB = computeTriangleAABB(tv1.first, tv2.first, tv3.first);
 
+        // if the traingle is out of NDC -> skip it
         if (!checkAABBIntersect(renderTargetDimensions, triangleAABB))
             continue;
 
         // rasterization
-        const auto coveredPixels = rasterizeTriangle(triangleAABB, tv1.first, tv2.first, tv3.first);
+        const auto coveredFragments = rasterizeTriangle(triangleAABB, tv1.first, tv2.first,
+                                                        tv3.first);
 
-        // TODO: check depth against depth buffer
+        for (const auto &fragment : coveredFragments)
+        {
+            const int linearFragmentCoordinates = fragment.y * renderTargetDimensions.width
+                                                  + fragment.x;
+            const auto fragmentBarycentricCoordinates = computeBarycentricCoordinates(fragment,
+                                                                                      tv1.first,
+                                                                                      tv2.first,
+                                                                                      tv3.first);
 
-        // TODO: compute barycentrics per pixel
+            // depth processing
+            {
+                // TODO: formalize this convention
+                double *depthBufPtr = reinterpret_cast<double *>(depthBuffer.buffPtr)
+                                      + linearFragmentCoordinates;
+                const auto storedDepth = *depthBufPtr;
+                const auto currentDepth = glm::dot(fragmentBarycentricCoordinates,
+                                                   glm::vec3(tv1.first.z, tv2.first.z,
+                                                             tv3.first.z));
 
-        // TODO: interpolate attributes
+                if (currentDepth >= storedDepth)
+                    continue;
 
-        // TODO: run fragment shader
+                *depthBufPtr = currentDepth;
+            }
+
+            // color processing
+            {
+                std::vector<float> interpolatedAttributes;
+                interpolatedAttributes.reserve(tv1.second.size());
+                for (int a = 0; a < interpolatedAttributes.size(); ++a)
+                {
+                    interpolatedAttributes.emplace_back(
+                        glm::dot(fragmentBarycentricCoordinates,
+                                 glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a])));
+                }
+
+                const glm::vec4 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
+
+                // TODO: formalize this convention
+                glm::vec4 *colorBufPtr = reinterpret_cast<glm::vec4 *>(colorBuffer.buffPtr)
+                                         + linearFragmentCoordinates;
+
+                *colorBufPtr = fragmentOutput;
+            }
+        }
     }
 }
 

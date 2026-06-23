@@ -20,7 +20,8 @@ enum ErrorCode
 {
     EC_OK,
     EC_UnsupportedBufferType,
-    EC_UnsupportedShaderType
+    EC_UnsupportedShaderType,
+    EC_InvalidOperation,
 };
 
 struct ReturnInfo
@@ -31,7 +32,8 @@ struct ReturnInfo
 
 // buffer management
 
-ReturnInfo bindBuffer(BufferType buffType, const char *buffPtr, int buffSize, int itemSize);
+ReturnInfo clearBuffer(BufferType buffType, char clearValue = 0);
+ReturnInfo bindBuffer(BufferType buffType, char *buffPtr, int buffSize, int itemSize);
 ReturnInfo unbindBuffer(BufferType buffType);
 ReturnInfo setRenderTargetDimensions(int width, int height);
 

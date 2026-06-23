@@ -3,8 +3,5 @@
 
 void rasterizeSimpleMesh()
 {
-    glm::vec3 v1;
-    glm::vec3 v2;
-
-    glm::vec3 t1 = v1 + v2;
+    // TODO: create horribly simple vertex and fragment shaders to test the pipeline
 }
