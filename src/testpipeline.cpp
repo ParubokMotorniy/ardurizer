@@ -1,11 +1,13 @@
+#include "testpipeline.h"
 #include "ardugl.h"
 #include "glm.hpp"
-#include "testpipeline.h"
+#include <ext/matrix_clip_space.hpp>
+#include <ext/matrix_transform.hpp>
 
 namespace
 {
-const int screenWidth = 960;
-const int screenHeight = 540;
+constexpr int screenWidth = 960;
+constexpr int screenHeight = 540;
 
 char *depthBuffer = new char[screenWidth * screenHeight * sizeof(double)];
 char *colorBuffer = new char[screenWidth * screenHeight * sizeof(glm::vec4)];
@@ -26,14 +28,30 @@ glm::vec3 *vertexPosBuffer = new glm::vec3[6 * 6]{
     { 0.0, 1.0, 0.0 }, { 1.0, 1.0, 0.0 }, { 1.0, 0.0, 0.0 } // clang-format on
 };
 
+glm::mat4 proj = glm::perspective(glm::radians(45.0), (double)screenWidth / (double)screenHeight,
+                                  0.1, 100.0);
+glm::mat4 view = glm::translate(glm::mat4(1.0), glm::vec3(0.0, 0.0, -3.0));
+
 } // namespace
 
 using VertexShaderOutput
     = std::pair<glm::vec4 /*view space vertex*/,
                 std::vector<float> /*attributes to be passed down the pipeline*/>;
-VertexShaderOutput cubeVertexShader(const char *vertex /*vertex data from buffer*/) {}
+VertexShaderOutput cubeVertexShader(const char *vertex /*vertex data from buffer*/)
+{
+    const glm::vec3 *vertexPos = reinterpret_cast<const glm::vec3 *>(vertex);
+    // TODO: add model transform
+    const glm::vec4 transformedPos = proj * view
+                                     * glm::vec4(vertexPos->x, vertexPos->y, vertexPos->z, 1.0);
+    return std::make_pair(transformedPos,
+                          std::vector<float>{ vertexPos->x, vertexPos->y, vertexPos->z });
+}
 
-glm::vec4 cubeFragmentShader(const std::vector<float> &interpolatedAttributes) {}
+glm::vec4 cubeFragmentShader(const std::vector<float> &interpolatedAttributes)
+{
+    assert(interpolatedAttributes.size() == 3);
+    return { interpolatedAttributes[0], interpolatedAttributes[1], interpolatedAttributes[2], 1.0 };
+}
 
 void initializePipeline()
 {
@@ -57,5 +75,6 @@ void initializePipeline()
 
 void drawCube()
 {
-    // TODO: create horribly simple vertex and fragment shaders to test the pipeline
+    // TODO: add a way to verify the result
+    ArduGL::renderPrimitives();
 }

@@ -22,7 +22,7 @@
   ],
   "build": {
     "flags": [
-      "-DGLM_FORCE_CXX17",
+      "-DGLM_FORCE_CXX20",
       "-DGLM_FORCE_PURE",
       "-DGLM_FORCE_SILENT_WARNINGS"
     ],
