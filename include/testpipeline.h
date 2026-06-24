@@ -1,3 +1,4 @@
 #pragma once
 
-void rasterizeSimpleMesh();
+void initializePipeline();
+void drawCube();

@@ -44,7 +44,7 @@ ReturnInfo setRenderTargetDimensions(int width, int height);
 //  std::pair<glm::vec4 /*ndc vertex*/, std::vector<char> /*attributes to be passed down the
 //  pipeline*/> vertexShader(const char * vertex); glm::vec4 /*color*/ fragmentShader(const
 //  std::vector<char> &interpolatedAttributes);
-ReturnInfo bindShader(ShaderType shType, const void *shaderFuncPtr);
+ReturnInfo bindShader(ShaderType shType, void *shaderFuncPtr);
 ReturnInfo unbindShader(ShaderType shType);
 
 // pipeline operation

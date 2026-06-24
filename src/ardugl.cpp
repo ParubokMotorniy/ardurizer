@@ -104,16 +104,16 @@ ArduGL::ReturnInfo ArduGL::setRenderTargetDimensions(int width, int height)
 
 // shader management
 
-using VetexShaderOutput
+using VertexShaderOutput
     = std::pair<glm::vec4 /*view space vertex*/,
                 std::vector<float> /*attributes to be passed down the pipeline*/>;
-using VertexShader = VetexShaderOutput (*)(const char *vertex /*vertex data from buffer*/);
+using VertexShader = VertexShaderOutput (*)(const char *vertex /*vertex data from buffer*/);
 VertexShader vertexShaderPtr = nullptr;
 
 using FragmentShader = glm::vec4 /*color*/ (*)(const std::vector<float> &interpolatedAttributes);
 FragmentShader fragmentShaderPtr = nullptr;
 
-ArduGL::ReturnInfo ArduGL::bindShader(ShaderType shType, const void *shaderFuncPtr)
+ArduGL::ReturnInfo ArduGL::bindShader(ShaderType shType, void *shaderFuncPtr)
 {
     switch (shType)
     {
@@ -235,11 +235,11 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         // primitive assembly + vertex shader
         const char *triangleAttributesStart = vertexBuffer.buffPtr + v * vertexBuffer.itemSize;
 
-        VetexShaderOutput tv1 = vertexShaderPtr(triangleAttributesStart
+        VertexShaderOutput tv1 = vertexShaderPtr(triangleAttributesStart
                                                 + vertexBuffer.itemSize * 0);
-        VetexShaderOutput tv2 = vertexShaderPtr(triangleAttributesStart
+        VertexShaderOutput tv2 = vertexShaderPtr(triangleAttributesStart
                                                 + vertexBuffer.itemSize * 1);
-        VetexShaderOutput tv3 = vertexShaderPtr(triangleAttributesStart
+        VertexShaderOutput tv3 = vertexShaderPtr(triangleAttributesStart
                                                 + vertexBuffer.itemSize * 2);
 
         perspectiveDivide(tv1.first);
