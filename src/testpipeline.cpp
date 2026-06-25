@@ -4,13 +4,18 @@
 #include <ext/matrix_clip_space.hpp>
 #include <ext/matrix_transform.hpp>
 
+#include <Arduino.h>
+
 namespace
 {
 constexpr int screenWidth = 960;
 constexpr int screenHeight = 540;
 
-char *depthBuffer = new char[screenWidth * screenHeight * sizeof(double)];
-char *colorBuffer = new char[screenWidth * screenHeight * sizeof(glm::vec4)];
+constexpr int depthBufferSize = screenWidth * screenHeight * sizeof(double);
+char *depthBuffer = new char[depthBufferSize];
+
+constexpr int colorBufferSize = screenWidth * screenHeight * sizeof(glm::vec4);
+char *colorBuffer = new char[colorBufferSize];
 
 glm::vec3 *vertexPosBuffer = new glm::vec3[6 * 6]{
     // clang-format off
@@ -28,8 +33,8 @@ glm::vec3 *vertexPosBuffer = new glm::vec3[6 * 6]{
     { 0.0, 1.0, 0.0 }, { 1.0, 1.0, 0.0 }, { 1.0, 0.0, 0.0 } // clang-format on
 };
 
-glm::mat4 proj = glm::perspective(glm::radians(45.0), (double)screenWidth / (double)screenHeight,
-                                  0.1, 100.0);
+glm::mat4 proj = glm::perspective(/*glm::*/ radians(45.0),
+                                  (double)screenWidth / (double)screenHeight, 0.1, 100.0);
 glm::mat4 view = glm::translate(glm::mat4(1.0), glm::vec3(0.0, 0.0, -3.0));
 
 } // namespace
@@ -71,10 +76,16 @@ void initializePipeline()
     ArduGL::bindShader(ArduGL::ShaderType::ST_Vertex, reinterpret_cast<void *>(&cubeVertexShader));
     ArduGL::bindShader(ArduGL::ShaderType::ST_Fragment,
                        reinterpret_cast<void *>(&cubeFragmentShader));
+
+    Serial.begin(9600);
 }
 
 void drawCube()
 {
-    // TODO: add a way to verify the result
     ArduGL::renderPrimitives();
+    
+    Serial.println("Color buffer: ");
+    Serial.write(colorBuffer, colorBufferSize);
+    Serial.println("Depth buffer: ");
+    Serial.write(depthBuffer, depthBufferSize);
 }
