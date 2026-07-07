@@ -110,7 +110,7 @@ using VertexShaderOutput
 using VertexShader = VertexShaderOutput (*)(const char *vertex /*vertex data from buffer*/);
 VertexShader vertexShaderPtr = nullptr;
 
-using FragmentShader = glm::vec4 /*color*/ (*)(const std::vector<float> &interpolatedAttributes);
+using FragmentShader = glm::vec3 /*color*/ (*)(const std::vector<float> &interpolatedAttributes);
 FragmentShader fragmentShaderPtr = nullptr;
 
 ArduGL::ReturnInfo ArduGL::bindShader(ShaderType shType, void *shaderFuncPtr)
@@ -145,8 +145,14 @@ ArduGL::ReturnInfo ArduGL::unbindShader(ShaderType shType)
 
 // pipeline execution
 
-void perspectiveDivide(glm::vec4 &clipPos) { clipPos /= clipPos.w; }
+void perspectiveDivide(glm::vec4 &clipPos)
+{
+    clipPos.x /= clipPos.w;
+    clipPos.y /= clipPos.w;
+    clipPos.z /= clipPos.w;
+}
 
+// shifts z to [0,1]
 void rescaleZ(glm::vec4 &ndcPos)
 {
     ndcPos.z += 1.0;
@@ -236,11 +242,11 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         const char *triangleAttributesStart = vertexBuffer.buffPtr + v * vertexBuffer.itemSize;
 
         VertexShaderOutput tv1 = vertexShaderPtr(triangleAttributesStart
-                                                + vertexBuffer.itemSize * 0);
+                                                 + vertexBuffer.itemSize * 0);
         VertexShaderOutput tv2 = vertexShaderPtr(triangleAttributesStart
-                                                + vertexBuffer.itemSize * 1);
+                                                 + vertexBuffer.itemSize * 1);
         VertexShaderOutput tv3 = vertexShaderPtr(triangleAttributesStart
-                                                + vertexBuffer.itemSize * 2);
+                                                 + vertexBuffer.itemSize * 2);
 
         perspectiveDivide(tv1.first);
         perspectiveDivide(tv2.first);
@@ -281,20 +287,25 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                                                                       tv2.first,
                                                                                       tv3.first);
 
+            const glm::vec3 oneOverWs = glm::vec3(1.0 / tv1.first.w, 1.0 / tv2.first.w,
+                                                  1.0 / tv3.first.w);
+            const float oneOverW = glm::dot(fragmentBarycentricCoordinates, oneOverWs);
+
             // depth processing
             {
                 // TODO: formalize this convention
-                double *depthBufPtr = reinterpret_cast<double *>(depthBuffer.buffPtr)
-                                      + linearFragmentCoordinates;
+                float *depthBufPtr = reinterpret_cast<float *>(depthBuffer.buffPtr)
+                                     + linearFragmentCoordinates;
                 const auto storedDepth = *depthBufPtr;
-                const auto currentDepth = glm::dot(fragmentBarycentricCoordinates,
-                                                   glm::vec3(tv1.first.z, tv2.first.z,
-                                                             tv3.first.z));
+                const auto currentNonLinearDepth = glm::dot(fragmentBarycentricCoordinates,
+                                                            glm::vec3(tv1.first.z, tv2.first.z,
+                                                                      tv3.first.z)
+                                                                * oneOverWs);
 
-                if (currentDepth >= storedDepth)
+                if (currentNonLinearDepth <= storedDepth)
                     continue;
 
-                *depthBufPtr = currentDepth;
+                *depthBufPtr = currentNonLinearDepth;
             }
 
             // color processing
@@ -305,13 +316,14 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                 {
                     interpolatedAttributes.emplace_back(
                         glm::dot(fragmentBarycentricCoordinates,
-                                 glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a])));
+                                 glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a]) * oneOverWs)
+                        / oneOverW);
                 }
 
-                const glm::vec4 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
+                const glm::vec3 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
 
-                // TODO: formalize this convention
-                glm::vec4 *colorBufPtr = reinterpret_cast<glm::vec4 *>(colorBuffer.buffPtr)
+                // TODO: formalize this convention and absence of alpha support
+                glm::vec3 *colorBufPtr = reinterpret_cast<glm::vec3 *>(colorBuffer.buffPtr)
                                          + linearFragmentCoordinates;
 
                 *colorBufPtr = fragmentOutput;

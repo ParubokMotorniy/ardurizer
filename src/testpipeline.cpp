@@ -8,13 +8,13 @@
 
 namespace
 {
-constexpr int screenWidth = 960;
-constexpr int screenHeight = 540;
+constexpr int screenWidth = 240 / 8;
+constexpr int screenHeight = 135 / 8;
 
-constexpr int depthBufferSize = screenWidth * screenHeight * sizeof(double);
+constexpr int depthBufferSize = screenWidth * screenHeight * sizeof(float);
 char *depthBuffer = new char[depthBufferSize];
 
-constexpr int colorBufferSize = screenWidth * screenHeight * sizeof(glm::vec4);
+constexpr int colorBufferSize = screenWidth * screenHeight * sizeof(glm::vec3);
 char *colorBuffer = new char[colorBufferSize];
 
 glm::vec3 *vertexPosBuffer = new glm::vec3[6 * 6]{
@@ -52,10 +52,10 @@ VertexShaderOutput cubeVertexShader(const char *vertex /*vertex data from buffer
                           std::vector<float>{ vertexPos->x, vertexPos->y, vertexPos->z });
 }
 
-glm::vec4 cubeFragmentShader(const std::vector<float> &interpolatedAttributes)
+glm::vec3 cubeFragmentShader(const std::vector<float> &interpolatedAttributes)
 {
     assert(interpolatedAttributes.size() == 3);
-    return { interpolatedAttributes[0], interpolatedAttributes[1], interpolatedAttributes[2], 1.0 };
+    return { interpolatedAttributes[0], interpolatedAttributes[1], interpolatedAttributes[2]};
 }
 
 void initializePipeline()
@@ -63,9 +63,9 @@ void initializePipeline()
     ArduGL::setRenderTargetDimensions(screenWidth, screenHeight);
 
     ArduGL::bindBuffer(ArduGL::BufferType::BT_Depth, depthBuffer, sizeof(depthBuffer),
-                       sizeof(double));
+                       sizeof(float));
     ArduGL::bindBuffer(ArduGL::BufferType::BT_Color, colorBuffer, sizeof(colorBuffer),
-                       sizeof(glm::vec4));
+                       sizeof(glm::vec3));
     ArduGL::bindBuffer(ArduGL::BufferType::BT_VertexAttribute,
                        reinterpret_cast<char *>(vertexPosBuffer), sizeof(vertexPosBuffer),
                        sizeof(glm::vec3));
@@ -77,7 +77,7 @@ void initializePipeline()
     ArduGL::bindShader(ArduGL::ShaderType::ST_Fragment,
                        reinterpret_cast<void *>(&cubeFragmentShader));
 
-    Serial.begin(9600);
+    Serial.begin(115200, SERIAL_8N1);
 }
 
 void drawCube()
