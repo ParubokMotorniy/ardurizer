@@ -2,8 +2,43 @@
 
 #include "glm.hpp"
 
+#include <Arduino.h>
+
 #include <cstring>
+#include <malloc.h>
 #include <vector>
+
+extern char __HeapBase;
+extern char __StackTop;
+
+static void printRamInfo()
+{
+    constexpr uintptr_t RAM_START = 0x20000000;
+    constexpr size_t RAM_SIZE = 32 * 1024;
+
+    char stackMarker;
+    auto mi = mallinfo();
+
+    size_t staticUsed = (uintptr_t)&__HeapBase - RAM_START;
+    size_t heapUsed = mi.uordblks;
+    size_t stackUsed = (uintptr_t)&__StackTop - (uintptr_t)&stackMarker;
+
+    Serial.println("RAM:");
+    Serial.print("  total SRAM:   ");
+    Serial.println(RAM_SIZE);
+
+    Serial.print("  static used:  ");
+    Serial.println(staticUsed);
+
+    Serial.print("  heap used:    ");
+    Serial.println(heapUsed);
+
+    Serial.print("  stack used:   ");
+    Serial.println(stackUsed);
+
+    Serial.print("  rough free:   ");
+    Serial.println(RAM_SIZE - staticUsed - heapUsed - stackUsed);
+}
 
 struct Buffer
 {
@@ -28,6 +63,15 @@ Buffer indexBuffer;
 Buffer colorBuffer;
 Buffer depthBuffer;
 AABB renderTargetDimensions;
+
+// TODO: ideally, replace with vector. But that breaks everything.
+constexpr int maxRasterizedFragments = (240 / 8) * (135 / 8);
+
+struct RasterizedTriangle
+{
+    glm::vec2 fragments[maxRasterizedFragments];
+    int count = 0;
+};
 
 ArduGL::ReturnInfo ArduGL::clearBuffer(BufferType buffType, char clearValue)
 {
@@ -163,7 +207,9 @@ void mapToScreen(glm::vec4 &ndcPos)
 {
     // shifts the viewport (not configurable)
     ndcPos.x += 1.0;
+    ndcPos.x /= 2.0;
     ndcPos.y += 1.0;
+    ndcPos.y /= 2.0;
 
     // stretches the vector according to render target dimensions.
     ndcPos.x *= static_cast<float>(renderTargetDimensions.width);
@@ -190,14 +236,21 @@ bool checkAABBIntersect(const AABB &b1, const AABB &b2)
     return !noIntersection;
 }
 
-std::vector<glm::vec2> rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1,
-                                         const glm::vec4 &v2, const glm::vec4 &v3)
+RasterizedTriangle rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1,
+                                     const glm::vec4 &v2, const glm::vec4 &v3)
 {
     const glm::vec3 v1Pos{ v1.x, v1.y, 0 };
     const glm::vec3 v2Pos{ v2.x, v2.y, 0 };
     const glm::vec3 v3Pos{ v3.x, v3.y, 0 };
 
-    std::vector<glm::vec2> coveredFragments; // TODO: I believe this can be optimized
+    RasterizedTriangle coveredFragments;
+
+    // const int xMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blX)), 0);
+    // const int xMax = glm::min(static_cast<int>(triangleAABB.blX + triangleAABB.width),
+    //                           static_cast<int>(renderTargetDimensions.width));
+    // const int yMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blY)), 0);
+    // const int yMax = glm::min(static_cast<int>(triangleAABB.blY + triangleAABB.height),
+    //                           static_cast<int>(renderTargetDimensions.height));
 
     for (int x = glm::ceil(triangleAABB.blX), xMax = triangleAABB.blX + triangleAABB.width;
          x < xMax; ++x)
@@ -212,9 +265,13 @@ std::vector<glm::vec2> rasterizeTriangle(const AABB &triangleAABB, const glm::ve
                   && glm::cross(fragmentCoordinates - v2Pos, v3Pos - v2Pos).z >= 0.0
                   && glm::cross(fragmentCoordinates - v3Pos, v1Pos - v3Pos).z >= 0.0;
             if (pixelCenterIsCovered)
-                coveredFragments.emplace_back(x, y);
+            {
+                coveredFragments.fragments[coveredFragments.count++] = glm::vec2{ x, y };
+            }
         }
     }
+
+    return coveredFragments;
 }
 
 glm::vec3 computeBarycentricCoordinates(const glm::vec2 &point, const glm::vec4 &v1,
@@ -236,10 +293,14 @@ glm::vec3 computeBarycentricCoordinates(const glm::vec2 &point, const glm::vec4 
 
 ArduGL::ReturnInfo ArduGL::renderPrimitives()
 {
-    for (int v = 0; v < vertexBuffer.buffSize; v += 3)
+    for (int v = 0, totalTriangles = vertexBuffer.buffSize / (3 * vertexBuffer.itemSize);
+         v < totalTriangles; ++v)
     {
+        Serial.print("- Processing triangle: ");
+        Serial.println(v);
+
         // primitive assembly + vertex shader
-        const char *triangleAttributesStart = vertexBuffer.buffPtr + v * vertexBuffer.itemSize;
+        const char *triangleAttributesStart = vertexBuffer.buffPtr + v * 3 * vertexBuffer.itemSize;
 
         VertexShaderOutput tv1 = vertexShaderPtr(triangleAttributesStart
                                                  + vertexBuffer.itemSize * 0);
@@ -268,6 +329,8 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         mapToScreen(tv2.first);
         mapToScreen(tv3.first);
 
+        Serial.println("--- Transformed triangle.");
+
         const AABB triangleAABB = computeTriangleAABB(tv1.first, tv2.first, tv3.first);
 
         // if the traingle is out of NDC -> skip it
@@ -275,60 +338,66 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
             continue;
 
         // rasterization
-        const auto coveredFragments = rasterizeTriangle(triangleAABB, tv1.first, tv2.first,
-                                                        tv3.first);
+        const RasterizedTriangle coveredFragments = rasterizeTriangle(triangleAABB, tv1.first,
+                                                                      tv2.first, tv3.first);
 
-        for (const auto &fragment : coveredFragments)
-        {
-            const int linearFragmentCoordinates = fragment.y * renderTargetDimensions.width
-                                                  + fragment.x;
-            const auto fragmentBarycentricCoordinates = computeBarycentricCoordinates(fragment,
-                                                                                      tv1.first,
-                                                                                      tv2.first,
-                                                                                      tv3.first);
+        Serial.println("--- Rasterized triangle.");
+        Serial.print("--- Total fragments covered: ");
+        Serial.println(coveredFragments.count);
 
-            const glm::vec3 oneOverWs = glm::vec3(1.0 / tv1.first.w, 1.0 / tv2.first.w,
-                                                  1.0 / tv3.first.w);
-            const float oneOverW = glm::dot(fragmentBarycentricCoordinates, oneOverWs);
+        // for (int fragmentIndex = 0; fragmentIndex < coveredFragments.count; ++fragmentIndex)
+        // {
+        //     const auto &fragment = coveredFragments.fragments[fragmentIndex];
+        //     const int linearFragmentCoordinates = fragment.y * renderTargetDimensions.width
+        //                                           + fragment.x;
+        //     const auto fragmentBarycentricCoordinates = computeBarycentricCoordinates(fragment,
+        //                                                                               tv1.first,
+        //                                                                               tv2.first,
+        //                                                                               tv3.first);
 
-            // depth processing
-            {
-                // TODO: formalize this convention
-                float *depthBufPtr = reinterpret_cast<float *>(depthBuffer.buffPtr)
-                                     + linearFragmentCoordinates;
-                const auto storedDepth = *depthBufPtr;
-                const auto currentNonLinearDepth = glm::dot(fragmentBarycentricCoordinates,
-                                                            glm::vec3(tv1.first.z, tv2.first.z,
-                                                                      tv3.first.z)
-                                                                * oneOverWs);
+        //     const glm::vec3 oneOverWs = glm::vec3(1.0 / tv1.first.w, 1.0 / tv2.first.w,
+        //                                           1.0 / tv3.first.w);
+        //     const float oneOverW = glm::dot(fragmentBarycentricCoordinates, oneOverWs);
 
-                if (currentNonLinearDepth <= storedDepth)
-                    continue;
+        //     // depth processing
+        //     {
+        //         // TODO: formalize this convention
+        //         float *depthBufPtr = reinterpret_cast<float *>(depthBuffer.buffPtr)
+        //                              + linearFragmentCoordinates;
+        //         const auto storedDepth = *depthBufPtr;
+        //         const auto currentNonLinearDepth = glm::dot(fragmentBarycentricCoordinates,
+        //                                                     glm::vec3(tv1.first.z, tv2.first.z,
+        //                                                               tv3.first.z)
+        //                                                         * oneOverWs);
 
-                *depthBufPtr = currentNonLinearDepth;
-            }
+        //         if (currentNonLinearDepth <= storedDepth)
+        //             continue;
 
-            // color processing
-            {
-                std::vector<float> interpolatedAttributes;
-                interpolatedAttributes.reserve(tv1.second.size());
-                for (int a = 0; a < interpolatedAttributes.size(); ++a)
-                {
-                    interpolatedAttributes.emplace_back(
-                        glm::dot(fragmentBarycentricCoordinates,
-                                 glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a]) * oneOverWs)
-                        / oneOverW);
-                }
+        //         *depthBufPtr = currentNonLinearDepth;
+        //     }
 
-                const glm::vec3 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
+        //     // color processing
+        //     {
+        //         std::vector<float> interpolatedAttributes;
+        //         interpolatedAttributes.reserve(tv1.second.size());
+        //         for (int a = 0; a < interpolatedAttributes.size(); ++a)
+        //         {
+        //             interpolatedAttributes.emplace_back(
+        //                 glm::dot(fragmentBarycentricCoordinates,
+        //                          glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a]) *
+        //                          oneOverWs)
+        //                 / oneOverW);
+        //         }
 
-                // TODO: formalize this convention and absence of alpha support
-                glm::vec3 *colorBufPtr = reinterpret_cast<glm::vec3 *>(colorBuffer.buffPtr)
-                                         + linearFragmentCoordinates;
+        //         const glm::vec3 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
 
-                *colorBufPtr = fragmentOutput;
-            }
-        }
+        //         // TODO: formalize this convention and absence of alpha support
+        //         glm::vec3 *colorBufPtr = reinterpret_cast<glm::vec3 *>(colorBuffer.buffPtr)
+        //                                  + linearFragmentCoordinates;
+
+        //         *colorBufPtr = fragmentOutput;
+        //     }
+        // }
     }
 }
 

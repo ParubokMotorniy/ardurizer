@@ -17,6 +17,7 @@ char *depthBuffer = new char[depthBufferSize];
 constexpr int colorBufferSize = screenWidth * screenHeight * sizeof(glm::vec3);
 char *colorBuffer = new char[colorBufferSize];
 
+constexpr int vertexBufferSize = 6 * 6 * sizeof(glm::vec3);
 glm::vec3 *vertexPosBuffer = new glm::vec3[6 * 6]{
     // clang-format off
     { 0.0, 0.0, 0.0 }, { 0.0, 0.0, 1.0 }, { 1.0, 0.0, 1.0 }, 
@@ -55,23 +56,19 @@ VertexShaderOutput cubeVertexShader(const char *vertex /*vertex data from buffer
 glm::vec3 cubeFragmentShader(const std::vector<float> &interpolatedAttributes)
 {
     assert(interpolatedAttributes.size() == 3);
-    return { interpolatedAttributes[0], interpolatedAttributes[1], interpolatedAttributes[2]};
+    return { interpolatedAttributes[0], interpolatedAttributes[1], interpolatedAttributes[2] };
 }
 
 void initializePipeline()
 {
     ArduGL::setRenderTargetDimensions(screenWidth, screenHeight);
 
-    ArduGL::bindBuffer(ArduGL::BufferType::BT_Depth, depthBuffer, sizeof(depthBuffer),
-                       sizeof(float));
-    ArduGL::bindBuffer(ArduGL::BufferType::BT_Color, colorBuffer, sizeof(colorBuffer),
+    ArduGL::bindBuffer(ArduGL::BufferType::BT_Depth, depthBuffer, depthBufferSize, sizeof(float));
+    ArduGL::bindBuffer(ArduGL::BufferType::BT_Color, colorBuffer, colorBufferSize,
                        sizeof(glm::vec3));
     ArduGL::bindBuffer(ArduGL::BufferType::BT_VertexAttribute,
-                       reinterpret_cast<char *>(vertexPosBuffer), sizeof(vertexPosBuffer),
+                       reinterpret_cast<char *>(vertexPosBuffer), vertexBufferSize,
                        sizeof(glm::vec3));
-
-    ArduGL::clearBuffer(ArduGL::BufferType::BT_Depth, 1.0);
-    ArduGL::clearBuffer(ArduGL::BufferType::BT_Color, 0.3);
 
     ArduGL::bindShader(ArduGL::ShaderType::ST_Vertex, reinterpret_cast<void *>(&cubeVertexShader));
     ArduGL::bindShader(ArduGL::ShaderType::ST_Fragment,
@@ -82,10 +79,15 @@ void initializePipeline()
 
 void drawCube()
 {
+    ArduGL::clearBuffer(ArduGL::BufferType::BT_Depth, 1.0);
+    ArduGL::clearBuffer(ArduGL::BufferType::BT_Color, 0.3);
+
     ArduGL::renderPrimitives();
-    
+
     Serial.println("Color buffer: ");
     Serial.write(colorBuffer, colorBufferSize);
+    Serial.println();
     Serial.println("Depth buffer: ");
     Serial.write(depthBuffer, depthBufferSize);
+    Serial.println();
 }
