@@ -69,7 +69,10 @@ constexpr int maxRasterizedFragments = (240 / 8) * (135 / 8);
 
 struct RasterizedTriangle
 {
-    glm::vec2 fragments[maxRasterizedFragments];
+    RasterizedTriangle() { fragments = new glm::vec2[maxRasterizedFragments]; }
+    ~RasterizedTriangle() { delete[] fragments; }
+
+    glm::vec2 *fragments = nullptr;
     int count = 0;
 };
 
@@ -236,14 +239,13 @@ bool checkAABBIntersect(const AABB &b1, const AABB &b2)
     return !noIntersection;
 }
 
-RasterizedTriangle rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1,
-                                     const glm::vec4 &v2, const glm::vec4 &v3)
+void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm::vec4 &v2,
+                       const glm::vec4 &v3, RasterizedTriangle &coveredFragments)
 {
     const glm::vec3 v1Pos{ v1.x, v1.y, 0 };
     const glm::vec3 v2Pos{ v2.x, v2.y, 0 };
     const glm::vec3 v3Pos{ v3.x, v3.y, 0 };
-
-    RasterizedTriangle coveredFragments;
+    coveredFragments.count = 0;
 
     // const int xMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blX)), 0);
     // const int xMax = glm::min(static_cast<int>(triangleAABB.blX + triangleAABB.width),
@@ -270,8 +272,6 @@ RasterizedTriangle rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &
             }
         }
     }
-
-    return coveredFragments;
 }
 
 glm::vec3 computeBarycentricCoordinates(const glm::vec2 &point, const glm::vec4 &v1,
@@ -293,6 +293,8 @@ glm::vec3 computeBarycentricCoordinates(const glm::vec2 &point, const glm::vec4 
 
 ArduGL::ReturnInfo ArduGL::renderPrimitives()
 {
+    RasterizedTriangle coveredFragments;
+
     for (int v = 0, totalTriangles = vertexBuffer.buffSize / (3 * vertexBuffer.itemSize);
          v < totalTriangles; ++v)
     {
@@ -338,66 +340,73 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
             continue;
 
         // rasterization
-        const RasterizedTriangle coveredFragments = rasterizeTriangle(triangleAABB, tv1.first,
-                                                                      tv2.first, tv3.first);
+        rasterizeTriangle(triangleAABB, tv1.first, tv2.first, tv3.first, coveredFragments);
 
         Serial.println("--- Rasterized triangle.");
         Serial.print("--- Total fragments covered: ");
         Serial.println(coveredFragments.count);
 
-        // for (int fragmentIndex = 0; fragmentIndex < coveredFragments.count; ++fragmentIndex)
-        // {
-        //     const auto &fragment = coveredFragments.fragments[fragmentIndex];
-        //     const int linearFragmentCoordinates = fragment.y * renderTargetDimensions.width
-        //                                           + fragment.x;
-        //     const auto fragmentBarycentricCoordinates = computeBarycentricCoordinates(fragment,
-        //                                                                               tv1.first,
-        //                                                                               tv2.first,
-        //                                                                               tv3.first);
+        for (int fragmentIndex = 0; fragmentIndex < coveredFragments.count; ++fragmentIndex)
+        {
+            const auto &fragment = coveredFragments.fragments[fragmentIndex];
+            const int linearFragmentCoordinates = fragment.y * renderTargetDimensions.width
+                                                  + fragment.x;
+            const auto fragmentBarycentricCoordinates = computeBarycentricCoordinates(fragment,
+                                                                                      tv1.first,
+                                                                                      tv2.first,
+                                                                                      tv3.first);
 
-        //     const glm::vec3 oneOverWs = glm::vec3(1.0 / tv1.first.w, 1.0 / tv2.first.w,
-        //                                           1.0 / tv3.first.w);
-        //     const float oneOverW = glm::dot(fragmentBarycentricCoordinates, oneOverWs);
+            const glm::vec3 oneOverWs = glm::vec3(1.0 / tv1.first.w, 1.0 / tv2.first.w,
+                                                  1.0 / tv3.first.w);
+            const float oneOverW = glm::dot(fragmentBarycentricCoordinates, oneOverWs);
 
-        //     // depth processing
-        //     {
-        //         // TODO: formalize this convention
-        //         float *depthBufPtr = reinterpret_cast<float *>(depthBuffer.buffPtr)
-        //                              + linearFragmentCoordinates;
-        //         const auto storedDepth = *depthBufPtr;
-        //         const auto currentNonLinearDepth = glm::dot(fragmentBarycentricCoordinates,
-        //                                                     glm::vec3(tv1.first.z, tv2.first.z,
-        //                                                               tv3.first.z)
-        //                                                         * oneOverWs);
+            Serial.println("----- Computed barycentrics");
 
-        //         if (currentNonLinearDepth <= storedDepth)
-        //             continue;
+            // depth processing
+            {
+                // TODO: formalize this convention
+                float *depthBufPtr = reinterpret_cast<float *>(depthBuffer.buffPtr)
+                                     + linearFragmentCoordinates;
+                const auto storedDepth = *depthBufPtr;
+                const auto currentNonLinearDepth = glm::dot(fragmentBarycentricCoordinates,
+                                                            glm::vec3(tv1.first.z, tv2.first.z,
+                                                                      tv3.first.z)
+                                                                * oneOverWs);
 
-        //         *depthBufPtr = currentNonLinearDepth;
-        //     }
+                Serial.println("----- Computed depth");
 
-        //     // color processing
-        //     {
-        //         std::vector<float> interpolatedAttributes;
-        //         interpolatedAttributes.reserve(tv1.second.size());
-        //         for (int a = 0; a < interpolatedAttributes.size(); ++a)
-        //         {
-        //             interpolatedAttributes.emplace_back(
-        //                 glm::dot(fragmentBarycentricCoordinates,
-        //                          glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a]) *
-        //                          oneOverWs)
-        //                 / oneOverW);
-        //         }
+                if (currentNonLinearDepth <= storedDepth)
+                    continue;
 
-        //         const glm::vec3 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
+                *depthBufPtr = currentNonLinearDepth;
+                Serial.println("------ Wrote depth");
+            }
 
-        //         // TODO: formalize this convention and absence of alpha support
-        //         glm::vec3 *colorBufPtr = reinterpret_cast<glm::vec3 *>(colorBuffer.buffPtr)
-        //                                  + linearFragmentCoordinates;
+            // color processing
+            {
+                std::vector<float> interpolatedAttributes;
+                const int numTotalAttributes = tv1.second.size();
+                interpolatedAttributes.reserve(numTotalAttributes);
+                for (int a = 0; a < numTotalAttributes; ++a)
+                {
+                    interpolatedAttributes.emplace_back(
+                        glm::dot(fragmentBarycentricCoordinates,
+                                 glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a]) * oneOverWs)
+                        / oneOverW);
+                }
+                Serial.println("----- Interpolated attributes");
 
-        //         *colorBufPtr = fragmentOutput;
-        //     }
-        // }
+                const glm::vec3 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
+                Serial.println("----- Computed color");
+
+                // TODO: formalize this convention and absence of alpha support
+                glm::vec3 *colorBufPtr = reinterpret_cast<glm::vec3 *>(colorBuffer.buffPtr)
+                                         + linearFragmentCoordinates;
+
+                *colorBufPtr = fragmentOutput;
+                Serial.println("------ Wrote color");
+            }
+        }
     }
 }
 

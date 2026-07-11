@@ -5,6 +5,7 @@
 #include <ext/matrix_transform.hpp>
 
 #include <Arduino.h>
+#include <vector>
 
 namespace
 {
