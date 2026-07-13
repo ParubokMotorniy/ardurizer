@@ -11,7 +11,6 @@ void setup()
 void loop()
 {
     // put your main code here, to run repeatedly:
-    // Serial.println("Stayin' alive");
     drawCube();
-    delay(10000);
+    // delay(1000);
 }

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert an RGB-float + depth-float frame dump into PNG images."""
+"""Convert RGB-float + depth-float frame dump chunks into PNGs or GIFs."""
 
 from __future__ import annotations
 
@@ -38,15 +38,18 @@ def make_color_pixels(values: tuple[float, ...], width: int, height: int) -> byt
     return bytes(pixels)
 
 
-def make_depth_pixels(values: tuple[float, ...]) -> bytes:
+def depth_range(values: tuple[float, ...]) -> tuple[float, float]:
     finite_values = [value for value in values if math.isfinite(value)]
     if not finite_values:
-        min_depth = 0.0
-        max_depth = 1.0
-    else:
-        min_depth = min(finite_values)
-        max_depth = max(finite_values)
+        return 0.0, 1.0
+    return min(finite_values), max(finite_values)
 
+
+def make_normalized_depth_pixels(
+    values: tuple[float, ...],
+    value_range: tuple[float, float],
+) -> bytes:
+    min_depth, max_depth = value_range
     depth_span = max_depth - min_depth
     if depth_span <= 0.0:
         depth_span = 1.0
@@ -61,11 +64,53 @@ def make_depth_pixels(values: tuple[float, ...]) -> bytes:
     return bytes(pixels)
 
 
+def make_frame_images(
+    frame_data: bytes,
+    width: int,
+    height: int,
+    color_buffer_size: int,
+    depth_buffer_size: int,
+    endian: str,
+    depth_value_range: tuple[float, float] | None = None,
+) -> tuple["Image.Image", "Image.Image"]:
+    depth_offset = color_buffer_size
+    color_data = frame_data[:depth_offset]
+    depth_data = frame_data[depth_offset : depth_offset + depth_buffer_size]
+
+    color_values = unpack_floats(color_data, endian)
+    depth_values = unpack_floats(depth_data, endian)
+
+    color_image = Image.frombytes(
+        "RGB",
+        (width, height),
+        make_color_pixels(color_values, width, height),
+    )
+    depth_image = Image.frombytes(
+        "L",
+        (width, height),
+        make_normalized_depth_pixels(
+            depth_values,
+            depth_value_range or depth_range(depth_values),
+        ),
+    )
+    return color_image, depth_image
+
+
+def split_frame_chunks(data: bytes, frame_size: int) -> tuple[list[bytes], int]:
+    complete_size = len(data) - (len(data) % frame_size)
+    frames = [
+        data[offset : offset + frame_size]
+        for offset in range(0, complete_size, frame_size)
+    ]
+    return frames, len(data) - complete_size
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Convert a frame dump containing RGB float32 pixels followed by "
-            "float32 depth values into color and grayscale depth PNGs."
+            "float32 depth values into color and grayscale depth images. "
+            "One complete frame writes PNGs; multiple complete frames write GIFs."
         )
     )
     parser.add_argument("width", type=int, help="frame width in pixels")
@@ -82,6 +127,12 @@ def parse_args() -> argparse.Namespace:
         choices=("little", "big"),
         default="little",
         help="float byte order in the dump file, default: little",
+    )
+    parser.add_argument(
+        "--duration",
+        type=int,
+        default=120,
+        help="GIF frame duration in milliseconds, default: 120",
     )
     return parser.parse_args()
 
@@ -108,43 +159,91 @@ def main() -> int:
         print(f"failed to read {args.dump_file}: {exc}", file=sys.stderr)
         return 1
 
-    if len(data) < expected_bytes:
-        print(
-            f"{args.dump_file} is too small: expected at least {expected_bytes} bytes, "
-            f"got {len(data)} bytes",
-            file=sys.stderr,
-        )
+    valid_frames, trailing_bytes = split_frame_chunks(data, expected_bytes)
+    if not valid_frames:
+        print(f"{args.dump_file} has no frame data", file=sys.stderr)
         return 1
 
-    if len(data) > expected_bytes:
+    depth_offset = color_buffer_size
+    output_prefix = args.output_prefix or args.dump_file.with_suffix("")
+
+    print(f"depth offset: {depth_offset} bytes")
+    print(f"frame size: {expected_bytes} bytes")
+    if trailing_bytes:
         print(
-            f"warning: ignoring {len(data) - expected_bytes} trailing bytes",
+            f"warning: ignoring {trailing_bytes} trailing byte(s) after "
+            f"{len(valid_frames)} complete frame(s)",
             file=sys.stderr,
         )
 
-    depth_offset = color_buffer_size
-    color_data = data[:depth_offset]
-    depth_data = data[depth_offset : depth_offset + depth_buffer_size]
+    if len(valid_frames) == 1:
+        color_path = output_prefix.with_name(output_prefix.name + "_color.png")
+        depth_path = output_prefix.with_name(output_prefix.name + "_depth.png")
+        color_image, depth_image = make_frame_images(
+            valid_frames[0],
+            args.width,
+            args.height,
+            color_buffer_size,
+            depth_buffer_size,
+            args.endian,
+        )
+        color_image.save(color_path)
+        depth_image.save(depth_path)
+        print("frames: 1")
+        print(f"wrote: {color_path}")
+        print(f"wrote: {depth_path}")
+        return 0
 
-    color_values = unpack_floats(color_data, args.endian)
-    depth_values = unpack_floats(depth_data, args.endian)
+    depth_values_by_frame = [
+        unpack_floats(frame[depth_offset : depth_offset + depth_buffer_size], args.endian)
+        for frame in valid_frames
+    ]
+    finite_depth_values = [
+        value
+        for frame_depth_values in depth_values_by_frame
+        for value in frame_depth_values
+        if math.isfinite(value)
+    ]
+    if finite_depth_values:
+        global_depth_range = (min(finite_depth_values), max(finite_depth_values))
+    else:
+        global_depth_range = (0.0, 1.0)
 
-    output_prefix = args.output_prefix or args.dump_file.with_suffix("")
-    color_path = output_prefix.with_name(output_prefix.name + "_color.png")
-    depth_path = output_prefix.with_name(output_prefix.name + "_depth.png")
+    color_frames = []
+    depth_frames = []
+    for frame in valid_frames:
+        color_image, depth_image = make_frame_images(
+            frame,
+            args.width,
+            args.height,
+            color_buffer_size,
+            depth_buffer_size,
+            args.endian,
+            global_depth_range,
+        )
+        color_frames.append(color_image)
+        depth_frames.append(depth_image)
 
-    Image.frombytes(
-        "RGB",
-        (args.width, args.height),
-        make_color_pixels(color_values, args.width, args.height),
-    ).save(color_path)
-    Image.frombytes(
-        "L",
-        (args.width, args.height),
-        make_depth_pixels(depth_values),
-    ).save(depth_path)
+    color_path = output_prefix.with_name(output_prefix.name + "_color.gif")
+    depth_path = output_prefix.with_name(output_prefix.name + "_depth.gif")
 
-    print(f"depth offset: {depth_offset} bytes")
+    color_frames[0].save(
+        color_path,
+        save_all=True,
+        append_images=color_frames[1:],
+        duration=args.duration,
+        loop=0,
+        optimize=False,
+    )
+    depth_frames[0].save(
+        depth_path,
+        save_all=True,
+        append_images=depth_frames[1:],
+        duration=args.duration,
+        loop=0,
+        optimize=False,
+    )
+    print(f"frames: {len(valid_frames)}")
     print(f"wrote: {color_path}")
     print(f"wrote: {depth_path}")
     return 0
