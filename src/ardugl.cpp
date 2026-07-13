@@ -298,8 +298,8 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
     for (int v = 0, totalTriangles = vertexBuffer.buffSize / (3 * vertexBuffer.itemSize);
          v < totalTriangles; ++v)
     {
-        Serial.print("- Processing triangle: ");
-        Serial.println(v);
+        // Serial.print("- Processing triangle: ");
+        // Serial.println(v);
 
         // primitive assembly + vertex shader
         const char *triangleAttributesStart = vertexBuffer.buffPtr + v * 3 * vertexBuffer.itemSize;
@@ -311,15 +311,15 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         VertexShaderOutput tv3 = vertexShaderPtr(triangleAttributesStart
                                                  + vertexBuffer.itemSize * 2);
 
+        assert(static_cast<int>(renderTargetDimensions.width * renderTargetDimensions.height)
+               == (colorBuffer.buffSize / colorBuffer.itemSize));
+
         perspectiveDivide(tv1.first);
         perspectiveDivide(tv2.first);
         perspectiveDivide(tv3.first);
 
         // clipping - skipped for now
         // face culling - skipped for now
-
-        assert(static_cast<int>(renderTargetDimensions.width * renderTargetDimensions.height)
-               == (colorBuffer.buffSize / colorBuffer.itemSize));
 
         // shift z
         rescaleZ(tv1.first);
@@ -331,7 +331,7 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         mapToScreen(tv2.first);
         mapToScreen(tv3.first);
 
-        Serial.println("--- Transformed triangle.");
+        // Serial.println("--- Transformed triangle.");
 
         const AABB triangleAABB = computeTriangleAABB(tv1.first, tv2.first, tv3.first);
 
@@ -342,9 +342,9 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         // rasterization
         rasterizeTriangle(triangleAABB, tv1.first, tv2.first, tv3.first, coveredFragments);
 
-        Serial.println("--- Rasterized triangle.");
-        Serial.print("--- Total fragments covered: ");
-        Serial.println(coveredFragments.count);
+        // Serial.println("--- Rasterized triangle.");
+        // Serial.print("--- Total fragments covered: ");
+        // Serial.println(coveredFragments.count);
 
         for (int fragmentIndex = 0; fragmentIndex < coveredFragments.count; ++fragmentIndex)
         {
@@ -360,7 +360,7 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                                   1.0 / tv3.first.w);
             const float oneOverW = glm::dot(fragmentBarycentricCoordinates, oneOverWs);
 
-            Serial.println("----- Computed barycentrics");
+            // Serial.println("----- Computed barycentrics");
 
             // depth processing
             {
@@ -373,13 +373,13 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                                                       tv3.first.z)
                                                                 * oneOverWs);
 
-                Serial.println("----- Computed depth");
+                // Serial.println("----- Computed depth");
 
                 if (currentNonLinearDepth <= storedDepth)
                     continue;
 
                 *depthBufPtr = currentNonLinearDepth;
-                Serial.println("------ Wrote depth");
+                // Serial.println("------ Wrote depth");
             }
 
             // color processing
@@ -394,17 +394,17 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                  glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a]) * oneOverWs)
                         / oneOverW);
                 }
-                Serial.println("----- Interpolated attributes");
+                // Serial.println("----- Interpolated attributes");
 
                 const glm::vec3 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
-                Serial.println("----- Computed color");
+                // Serial.println("----- Computed color");
 
                 // TODO: formalize this convention and absence of alpha support
                 glm::vec3 *colorBufPtr = reinterpret_cast<glm::vec3 *>(colorBuffer.buffPtr)
                                          + linearFragmentCoordinates;
 
                 *colorBufPtr = fragmentOutput;
-                Serial.println("------ Wrote color");
+                // Serial.println("------ Wrote color");
             }
         }
     }

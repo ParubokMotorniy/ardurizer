@@ -85,10 +85,13 @@ void drawCube()
 
     ArduGL::renderPrimitives();
 
-    Serial.println("Color buffer: ");
+    // Serial.println(colorBufferSize + depthBufferSize);
+    // Serial.println("Color buffer: ");
     Serial.write(colorBuffer, colorBufferSize);
-    Serial.println();
-    Serial.println("Depth buffer: ");
+    // Serial.println();
+    // Serial.println("Depth buffer: ");
     Serial.write(depthBuffer, depthBufferSize);
-    Serial.println();
+    // Serial.println();
+    // Serial.println("Over");
+    Serial.flush();
 }
