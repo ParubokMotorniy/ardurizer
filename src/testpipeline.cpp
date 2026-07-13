@@ -39,6 +39,10 @@ glm::mat4 proj = glm::perspective(/*glm::*/ radians(45.0),
                                   (double)screenWidth / (double)screenHeight, 0.1, 100.0);
 glm::mat4 view = glm::translate(glm::mat4(1.0), glm::vec3(0.0, 0.0, -3.0));
 
+glm::mat4 model = glm::translate(glm::identity<glm::mat4>(), glm::vec3(-1.0, -1.0, -1.0))
+                  * glm::rotate(glm::identity<glm::mat4>(), /*glm::*/ (float)radians(45.0),
+                                glm::vec3(0.0, 1.0, 0.0))
+                  * glm::scale(glm::identity<glm::mat4>(), glm::vec3(2.0, 2.0, 2.0));
 } // namespace
 
 using VertexShaderOutput
@@ -48,16 +52,16 @@ VertexShaderOutput cubeVertexShader(const char *vertex /*vertex data from buffer
 {
     const glm::vec3 *vertexPos = reinterpret_cast<const glm::vec3 *>(vertex);
     // TODO: add model transform
-    const glm::vec4 transformedPos = proj * view
-                                     * glm::vec4(vertexPos->x, vertexPos->y, vertexPos->z, 1.0);
-    return std::make_pair(transformedPos,
-                          std::vector<float>{ vertexPos->x, vertexPos->y, vertexPos->z });
+    const glm::vec4 worldPos = model * glm::vec4(vertexPos->x, vertexPos->y, vertexPos->z, 1.0);
+    const glm::vec4 transformedPos = proj * view * worldPos;
+    return std::make_pair(transformedPos, std::vector<float>{ worldPos.x, worldPos.y, worldPos.z });
 }
 
 glm::vec3 cubeFragmentShader(const std::vector<float> &interpolatedAttributes)
 {
     assert(interpolatedAttributes.size() == 3);
-    return { interpolatedAttributes[0], interpolatedAttributes[1], interpolatedAttributes[2] };
+    return glm::normalize(glm::vec3{ interpolatedAttributes[0], interpolatedAttributes[1],
+                                     interpolatedAttributes[2] });
 }
 
 void initializePipeline()

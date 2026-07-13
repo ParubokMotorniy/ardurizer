@@ -40,6 +40,14 @@ static void printRamInfo()
     Serial.println(RAM_SIZE - staticUsed - heapUsed - stackUsed);
 }
 
+static void printTriangleInfo(const glm::vec3 &t)
+{
+    Serial.println("Triangle info:");
+    Serial.println(t.x);
+    Serial.println(t.y);
+    Serial.println(t.z);
+}
+
 struct Buffer
 {
     char *buffPtr = nullptr;
@@ -211,6 +219,7 @@ void mapToScreen(glm::vec4 &ndcPos)
     // shifts the viewport (not configurable)
     ndcPos.x += 1.0;
     ndcPos.x /= 2.0;
+
     ndcPos.y += 1.0;
     ndcPos.y /= 2.0;
 
@@ -282,10 +291,11 @@ glm::vec3 computeBarycentricCoordinates(const glm::vec2 &point, const glm::vec4 
     const glm::vec3 v3Pos{ v3.x, v3.y, 0.0 };
     const glm::vec3 pointPos{ point.x, point.y, 0.0 };
 
-    const float triangleArea = glm::cross(v3Pos - v1Pos, v2Pos - v1Pos).length();
-    const float area1 = glm::cross(pointPos - v2Pos, pointPos - v3Pos).length();
-    const float area2 = glm::cross(pointPos - v1Pos, pointPos - v3Pos).length();
-    const float area3 = glm::cross(pointPos - v1Pos, pointPos - v2Pos).length();
+    //TODO: add renormalization of coords so that they ad up to 1 
+    const float triangleArea = glm::length(glm::cross(v3Pos - v1Pos, v2Pos - v1Pos));
+    const float area1 = glm::length(glm::cross(pointPos - v2Pos, pointPos - v3Pos));
+    const float area2 = glm::length(glm::cross(pointPos - v1Pos, pointPos - v3Pos));
+    const float area3 = glm::length(glm::cross(pointPos - v1Pos, pointPos - v2Pos));
 
     // actually, compares ratios of paralelogram areas
     return { area1 / triangleArea, area2 / triangleArea, area3 / triangleArea };
@@ -318,8 +328,8 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         perspectiveDivide(tv2.first);
         perspectiveDivide(tv3.first);
 
-        // clipping - skipped for now
-        // face culling - skipped for now
+        // TODO: NDC clipping
+        // TODO: face culling
 
         // shift z
         rescaleZ(tv1.first);
@@ -332,6 +342,9 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         mapToScreen(tv3.first);
 
         // Serial.println("--- Transformed triangle.");
+        // printTriangleInfo(tv1.first);
+        // printTriangleInfo(tv2.first);
+        // printTriangleInfo(tv3.first);
 
         const AABB triangleAABB = computeTriangleAABB(tv1.first, tv2.first, tv3.first);
 
@@ -351,6 +364,10 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
             const auto &fragment = coveredFragments.fragments[fragmentIndex];
             const int linearFragmentCoordinates = fragment.y * renderTargetDimensions.width
                                                   + fragment.x;
+            // Serial.println("----- Processed fragment");
+            // Serial.println(fragment.x);
+            // Serial.println(fragment.y);
+
             const auto fragmentBarycentricCoordinates = computeBarycentricCoordinates(fragment,
                                                                                       tv1.first,
                                                                                       tv2.first,
@@ -361,6 +378,9 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
             const float oneOverW = glm::dot(fragmentBarycentricCoordinates, oneOverWs);
 
             // Serial.println("----- Computed barycentrics");
+            // Serial.println(fragmentBarycentricCoordinates.x);
+            // Serial.println(fragmentBarycentricCoordinates.y);
+            // Serial.println(fragmentBarycentricCoordinates.z);
 
             // depth processing
             {
@@ -370,10 +390,10 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                 const auto storedDepth = *depthBufPtr;
                 const auto currentNonLinearDepth = glm::dot(fragmentBarycentricCoordinates,
                                                             glm::vec3(tv1.first.z, tv2.first.z,
-                                                                      tv3.first.z)
-                                                                * oneOverWs);
+                                                                      tv3.first.z));
 
                 // Serial.println("----- Computed depth");
+                // Serial.println(currentNonLinearDepth);
 
                 if (currentNonLinearDepth <= storedDepth)
                     continue;
@@ -398,6 +418,7 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
 
                 const glm::vec3 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
                 // Serial.println("----- Computed color");
+                // printTriangleInfo(fragmentOutput);
 
                 // TODO: formalize this convention and absence of alpha support
                 glm::vec3 *colorBufPtr = reinterpret_cast<glm::vec3 *>(colorBuffer.buffPtr)
