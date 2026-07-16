@@ -174,8 +174,10 @@ ArduGL::ReturnInfo ArduGL::bindShader(ShaderType shType, void *shaderFuncPtr)
     {
     case ShaderType::ST_Vertex:
         vertexShaderPtr = reinterpret_cast<VertexShader>(shaderFuncPtr);
+        break;
     case ShaderType::ST_Fragment:
         fragmentShaderPtr = reinterpret_cast<FragmentShader>(shaderFuncPtr);
+        break;
     default:
         return ReturnInfo{ false, EC_UnsupportedShaderType };
     }
@@ -256,18 +258,19 @@ void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm:
     const glm::vec3 v3Pos{ v3.x, v3.y, 0 };
     coveredFragments.count = 0;
 
-    // const int xMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blX)), 0);
-    // const int xMax = glm::min(static_cast<int>(triangleAABB.blX + triangleAABB.width),
-    //                           static_cast<int>(renderTargetDimensions.width));
-    // const int yMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blY)), 0);
-    // const int yMax = glm::min(static_cast<int>(triangleAABB.blY + triangleAABB.height),
-    //                           static_cast<int>(renderTargetDimensions.height));
+    const int xMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blX)), 0);
+    const int xMax = glm::min(static_cast<int>(glm::ceil(triangleAABB.blX + triangleAABB.width)),
+                              static_cast<int>(renderTargetDimensions.width));
+    const int yMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blY)), 0);
+    const int yMax = glm::min(static_cast<int>(glm::ceil(triangleAABB.blY + triangleAABB.height)),
+                              static_cast<int>(renderTargetDimensions.height));
 
-    for (int x = glm::ceil(triangleAABB.blX), xMax = triangleAABB.blX + triangleAABB.width;
-         x < xMax; ++x)
+    if (xMin >= xMax || yMin >= yMax)
+        return;
+
+    for (int x = xMin; x < xMax; ++x)
     {
-        for (int y = glm::ceil(triangleAABB.blY), yMax = triangleAABB.blY + triangleAABB.height;
-             y < yMax; ++y)
+        for (int y = yMin; y < yMax; ++y)
         {
             const glm::vec3 fragmentCoordinates{ x, y, 0.0 };
 
@@ -277,6 +280,11 @@ void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm:
                   && glm::cross(fragmentCoordinates - v3Pos, v1Pos - v3Pos).z >= 0.0;
             if (pixelCenterIsCovered)
             {
+                if (coveredFragments.count >= maxRasterizedFragments)
+                {
+                    assert(false); // TODO get rid of this and instead use dynamically sized buffers
+                    return;
+                }
                 coveredFragments.fragments[coveredFragments.count++] = glm::vec2{ x, y };
             }
         }
@@ -291,7 +299,7 @@ glm::vec3 computeBarycentricCoordinates(const glm::vec2 &point, const glm::vec4 
     const glm::vec3 v3Pos{ v3.x, v3.y, 0.0 };
     const glm::vec3 pointPos{ point.x, point.y, 0.0 };
 
-    //TODO: add renormalization of coords so that they ad up to 1 
+    // TODO: add renormalization of coords so that they ad up to 1
     const float triangleArea = glm::length(glm::cross(v3Pos - v1Pos, v2Pos - v1Pos));
     const float area1 = glm::length(glm::cross(pointPos - v2Pos, pointPos - v3Pos));
     const float area2 = glm::length(glm::cross(pointPos - v1Pos, pointPos - v3Pos));

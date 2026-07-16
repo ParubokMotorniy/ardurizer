@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert RGB-float + depth-float frame dump chunks into PNGs or GIFs."""
+"""Convert marked RGB-float + depth-float frame dumps into PNGs or GIFs."""
 
 from __future__ import annotations
 
@@ -96,13 +96,30 @@ def make_frame_images(
     return color_image, depth_image
 
 
-def split_frame_chunks(data: bytes, frame_size: int) -> tuple[list[bytes], int]:
-    complete_size = len(data) - (len(data) % frame_size)
-    frames = [
-        data[offset : offset + frame_size]
-        for offset in range(0, complete_size, frame_size)
-    ]
-    return frames, len(data) - complete_size
+def split_marked_frames(
+    data: bytes,
+    separator: bytes,
+    frame_size: int,
+) -> tuple[list[bytes], int, int]:
+    frames = []
+    ignored_bytes = 0
+    cursor = 0
+
+    while cursor < len(data):
+        marker_offset = data.find(separator, cursor)
+        if marker_offset < 0:
+            return frames, ignored_bytes, len(data) - cursor
+
+        ignored_bytes += marker_offset - cursor
+        payload_offset = marker_offset + len(separator)
+        payload_end = payload_offset + frame_size
+        if payload_end > len(data):
+            return frames, ignored_bytes, len(data) - marker_offset
+
+        frames.append(data[payload_offset:payload_end])
+        cursor = payload_end
+
+    return frames, ignored_bytes, 0
 
 
 def parse_args() -> argparse.Namespace:
@@ -110,12 +127,17 @@ def parse_args() -> argparse.Namespace:
         description=(
             "Convert a frame dump containing RGB float32 pixels followed by "
             "float32 depth values into color and grayscale depth images. "
-            "One complete frame writes PNGs; multiple complete frames write GIFs."
+            "Each frame must start with the separator word. One complete frame "
+            "writes PNGs; multiple complete frames write GIFs."
         )
     )
     parser.add_argument("width", type=int, help="frame width in pixels")
     parser.add_argument("height", type=int, help="frame height in pixels")
     parser.add_argument("dump_file", type=Path, help="binary frame dump file")
+    parser.add_argument(
+        "separator",
+        help="ASCII/UTF-8 marker that appears immediately before every frame",
+    )
     parser.add_argument(
         "-o",
         "--output-prefix",
@@ -147,6 +169,9 @@ def main() -> int:
     if args.width <= 0 or args.height <= 0:
         print("width and height must be positive", file=sys.stderr)
         return 2
+    if not args.separator:
+        print("separator must not be empty", file=sys.stderr)
+        return 2
 
     pixel_count = args.width * args.height
     color_buffer_size = pixel_count * 3 * 4
@@ -159,9 +184,18 @@ def main() -> int:
         print(f"failed to read {args.dump_file}: {exc}", file=sys.stderr)
         return 1
 
-    valid_frames, trailing_bytes = split_frame_chunks(data, expected_bytes)
+    separator = args.separator.encode()
+    valid_frames, ignored_bytes, trailing_bytes = split_marked_frames(
+        data,
+        separator,
+        expected_bytes,
+    )
     if not valid_frames:
-        print(f"{args.dump_file} has no frame data", file=sys.stderr)
+        print(
+            f"{args.dump_file} has no complete frame starting with "
+            f"{args.separator!r}",
+            file=sys.stderr,
+        )
         return 1
 
     depth_offset = color_buffer_size
@@ -169,10 +203,16 @@ def main() -> int:
 
     print(f"depth offset: {depth_offset} bytes")
     print(f"frame size: {expected_bytes} bytes")
+    print(f"separator: {args.separator!r} ({len(separator)} bytes)")
+    if ignored_bytes:
+        print(
+            f"warning: ignored {ignored_bytes} byte(s) before/between marked frames",
+            file=sys.stderr,
+        )
     if trailing_bytes:
         print(
-            f"warning: ignoring {trailing_bytes} trailing byte(s) after "
-            f"{len(valid_frames)} complete frame(s)",
+            f"warning: ignored {trailing_bytes} trailing byte(s) without a "
+            f"complete marked frame",
             file=sys.stderr,
         )
 
@@ -232,7 +272,6 @@ def main() -> int:
         save_all=True,
         append_images=color_frames[1:],
         duration=args.duration,
-        loop=0,
         optimize=False,
     )
     depth_frames[0].save(
@@ -240,7 +279,6 @@ def main() -> int:
         save_all=True,
         append_images=depth_frames[1:],
         duration=args.duration,
-        loop=0,
         optimize=False,
     )
     print(f"frames: {len(valid_frames)}")
