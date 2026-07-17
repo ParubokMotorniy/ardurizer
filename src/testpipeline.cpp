@@ -4,6 +4,8 @@
 #include <ext/matrix_clip_space.hpp>
 #include <ext/matrix_transform.hpp>
 
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
 #include <Arduino.h>
 #include <vector>
 
@@ -11,8 +13,12 @@
 
 namespace
 {
+
 constexpr int screenWidth = 240 / 8;
 constexpr int screenHeight = 135 / 8;
+
+// TODO: rework API to allow integers as color/depth valus to fit more of them and increase
+// resolution. Embedded screens won't let one tell the difference anyway.
 
 constexpr int depthBufferSize = screenWidth * screenHeight * sizeof(float);
 char *depthBuffer = new char[depthBufferSize];
@@ -29,18 +35,18 @@ struct Vertex
 constexpr int vertexBufferSize = 6 * 6 * sizeof(Vertex);
 Vertex *vertexBuffer = new Vertex[6 * 6]{
     // clang-format off
-    Vertex{ {0.0, 0.0, 0.0}, {1.00, 0.18, 0.16} }, Vertex{ {0.0, 0.0, 1.0}, {1.00, 0.32, 0.12} }, Vertex{ {1.0, 0.0, 1.0}, {0.92, 0.24, 0.10} }, 
-    Vertex{ {1.0, 0.0, 1.0}, {1.00, 0.55, 0.05} }, Vertex{ {1.0, 0.0, 0.0}, {0.95, 0.68, 0.10} }, Vertex{ {0.0, 0.0, 0.0}, {0.85, 0.48, 0.05} },
-    Vertex{ {1.0, 0.0, 0.0}, {0.85, 0.90, 0.12} }, Vertex{ {1.0, 0.0, 1.0}, {0.70, 1.00, 0.16} }, Vertex{ {1.0, 1.0, 1.0}, {0.55, 0.82, 0.08} },
-    Vertex{ {1.0, 1.0, 1.0}, {0.05, 0.85, 0.25} }, Vertex{ {1.0, 1.0, 0.0}, {0.12, 1.00, 0.42} }, Vertex{ {1.0, 0.0, 0.0}, {0.04, 0.65, 0.20} },
-    Vertex{ {1.0, 1.0, 0.0}, {0.03, 0.78, 0.65} }, Vertex{ {1.0, 1.0, 1.0}, {0.08, 0.95, 0.80} }, Vertex{ {0.0, 1.0, 1.0}, {0.02, 0.58, 0.52} },
-    Vertex{ {0.0, 1.0, 1.0}, {0.05, 0.65, 1.00} }, Vertex{ {0.0, 1.0, 0.0}, {0.12, 0.85, 1.00} }, Vertex{ {1.0, 1.0, 0.0}, {0.02, 0.48, 0.88} },
-    Vertex{ {0.0, 1.0, 0.0}, {0.10, 0.25, 1.00} }, Vertex{ {0.0, 1.0, 1.0}, {0.25, 0.42, 1.00} }, Vertex{ {0.0, 0.0, 1.0}, {0.05, 0.18, 0.78} },
-    Vertex{ {0.0, 0.0, 1.0}, {0.42, 0.18, 1.00} }, Vertex{ {0.0, 0.0, 0.0}, {0.58, 0.32, 1.00} }, Vertex{ {0.0, 1.0, 0.0}, {0.30, 0.12, 0.85} },
-    Vertex{ {1.0, 0.0, 1.0}, {0.85, 0.12, 1.00} }, Vertex{ {0.0, 0.0, 1.0}, {1.00, 0.32, 0.90} }, Vertex{ {0.0, 1.0, 1.0}, {0.68, 0.06, 0.78} }, 
-    Vertex{ {0.0, 1.0, 1.0}, {1.00, 0.14, 0.55} }, Vertex{ {1.0, 1.0, 1.0}, {1.00, 0.34, 0.68} }, Vertex{ {1.0, 0.0, 1.0}, {0.82, 0.08, 0.42} },
-    Vertex{ {1.0, 0.0, 0.0}, {1.00, 0.72, 0.45} }, Vertex{ {0.0, 0.0, 0.0}, {0.90, 0.58, 0.34} }, Vertex{ {0.0, 1.0, 0.0}, {0.75, 0.42, 0.25} }, 
-    Vertex{ {0.0, 1.0, 0.0}, {0.35, 1.00, 0.65} }, Vertex{ {1.0, 1.0, 0.0}, {0.52, 0.90, 0.80} }, Vertex{ {1.0, 0.0, 0.0}, {0.22, 0.72, 0.55} } // clang-format on
+    Vertex{ {0.0, 0.0, 0.0}, {1.00, 0.18, 0.16} }, Vertex{ {0.0, 0.0, 2.0}, {1.00, 0.32, 0.12} }, Vertex{ {2.0, 0.0, 2.0}, {0.92, 0.24, 0.10} }, 
+    Vertex{ {2.0, 0.0, 2.0}, {1.00, 0.55, 0.05} }, Vertex{ {2.0, 0.0, 0.0}, {0.95, 0.68, 0.10} }, Vertex{ {0.0, 0.0, 0.0}, {0.85, 0.48, 0.05} },
+    Vertex{ {2.0, 0.0, 0.0}, {0.85, 0.90, 0.12} }, Vertex{ {2.0, 0.0, 2.0}, {0.70, 1.00, 0.16} }, Vertex{ {2.0, 2.0, 2.0}, {0.55, 0.82, 0.08} },
+    Vertex{ {2.0, 2.0, 2.0}, {0.05, 0.85, 0.25} }, Vertex{ {2.0, 2.0, 0.0}, {0.12, 1.00, 0.42} }, Vertex{ {2.0, 0.0, 0.0}, {0.04, 0.65, 0.20} },
+    Vertex{ {2.0, 2.0, 0.0}, {0.03, 0.78, 0.65} }, Vertex{ {2.0, 2.0, 2.0}, {0.08, 0.95, 0.80} }, Vertex{ {0.0, 2.0, 2.0}, {0.02, 0.58, 0.52} },
+    Vertex{ {0.0, 2.0, 2.0}, {0.05, 0.65, 1.00} }, Vertex{ {0.0, 2.0, 0.0}, {0.12, 0.85, 1.00} }, Vertex{ {2.0, 2.0, 0.0}, {0.02, 0.48, 0.88} },
+    Vertex{ {0.0, 2.0, 0.0}, {0.10, 0.25, 1.00} }, Vertex{ {0.0, 2.0, 2.0}, {0.25, 0.42, 1.00} }, Vertex{ {0.0, 0.0, 2.0}, {0.05, 0.18, 0.78} },
+    Vertex{ {0.0, 0.0, 2.0}, {0.42, 0.18, 1.00} }, Vertex{ {0.0, 0.0, 0.0}, {0.58, 0.32, 1.00} }, Vertex{ {0.0, 2.0, 0.0}, {0.30, 0.12, 0.85} },
+    Vertex{ {2.0, 0.0, 2.0}, {0.85, 0.12, 1.00} }, Vertex{ {0.0, 0.0, 2.0}, {1.00, 0.32, 0.90} }, Vertex{ {0.0, 2.0, 2.0}, {0.68, 0.06, 0.78} }, 
+    Vertex{ {0.0, 2.0, 2.0}, {1.00, 0.14, 0.55} }, Vertex{ {2.0, 2.0, 2.0}, {1.00, 0.34, 0.68} }, Vertex{ {2.0, 0.0, 2.0}, {0.82, 0.08, 0.42} },
+    Vertex{ {2.0, 0.0, 0.0}, {1.00, 0.72, 0.45} }, Vertex{ {0.0, 0.0, 0.0}, {0.90, 0.58, 0.34} }, Vertex{ {0.0, 2.0, 0.0}, {0.75, 0.42, 0.25} }, 
+    Vertex{ {0.0, 2.0, 0.0}, {0.35, 1.00, 0.65} }, Vertex{ {2.0, 2.0, 0.0}, {0.52, 0.90, 0.80} }, Vertex{ {2.0, 0.0, 0.0}, {0.22, 0.72, 0.55} } // clang-format on
 };
 
 glm::mat4 proj = glm::perspective(glm::radians(45.0), (double)screenWidth / (double)screenHeight,
@@ -51,17 +57,33 @@ float currentRotationDeg = 0.0;
 
 glm::mat4 buildModelMatrix()
 {
-    // return glm::translate(glm::identity<glm::mat4>(), glm::vec3(-1.0 + currentRotationDeg))*
+    // return glm::translate(glm::identity<glm::mat4>(), glm::vec3(-2.0 + currentRotationDeg))*
     return glm::rotate(glm::identity<glm::mat4>(), currentRotationDeg * 2.0f * glm::pi<float>(),
                        glm::vec3(0.0, 1.0, 0.0));
     //    * glm::scale(glm::identity<glm::mat4>(), glm::vec3(2.5));
     //    * glm::rotate(glm::identity<glm::mat4>(), glm::radians(currentRotationDeg),
-    //                  glm::vec3(0.0, 1.0, 0.0));
+    //                  glm::vec3(0.0, 2.0, 0.0));
     //    * glm::scale(glm::identity<glm::mat4>(),
     //                 glm::vec3(3.0 * glm::sin(currentRotationDeg * glm::pi<float>())));
 }
 
 glm::mat4 currentModelMatrix = buildModelMatrix();
+
+Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 12, /*MOSI*/ 11, /*SCK*/ 13);
+
+uint16_t glmToRGB565(const glm::vec3 &fullColor)
+{
+    constexpr uint16_t max5BitColor = 31;
+    constexpr uint16_t max6BitColor = 63;
+
+    const uint16_t red = fullColor.r * max5BitColor;
+    const uint16_t green = fullColor.g * max6BitColor;
+    const uint16_t blue = fullColor.b * max5BitColor;
+
+    const uint16_t color565 = (red << (5 + 6)) | (green << 5) | blue;
+    return color565;
+}
+
 } // namespace
 
 using VertexShaderOutput
@@ -73,9 +95,8 @@ VertexShaderOutput cubeVertexShader(const char *rawVertex /*vertex data from buf
 
     const glm::vec3 *vertexPos = &vertex->position;
     const glm::vec3 *vertexColor = &vertex->color;
-    // TODO: add model transform
     const glm::vec4 worldPos = currentModelMatrix
-                               * glm::vec4(vertexPos->x, vertexPos->y, vertexPos->z, 1.0);
+                               * glm::vec4(vertexPos->x, vertexPos->y, vertexPos->z, 2.0);
     const glm::vec4 transformedPos = proj * view * worldPos;
 
     return std::make_pair(transformedPos,
@@ -104,11 +125,23 @@ void initializePipeline()
                        reinterpret_cast<void *>(&cubeFragmentShader));
 
     Serial.begin(115200, SERIAL_8N1);
+
+    tft.init(135, 240);
+    tft.fillScreen(ST77XX_GREEN);
+    delay(500);
+    tft.fillScreen(ST77XX_BLUE);
+    delay(500);
+    tft.fillScreen(ST77XX_RED);
+    delay(500);
+    tft.fillScreen(ST77XX_BLACK);
+
+    // a single pixel
+    // tft.drawPixel(tft.width() / 2, tft.height() / 2, ST77XX_GREEN);
 }
 
 void drawCube()
 {
-    ArduGL::clearBuffer(ArduGL::BufferType::BT_Depth, 1.0);
+    ArduGL::clearBuffer(ArduGL::BufferType::BT_Depth, 2.0);
     ArduGL::clearBuffer(ArduGL::BufferType::BT_Color, 0.5);
 
     currentModelMatrix = buildModelMatrix();
@@ -118,17 +151,23 @@ void drawCube()
 
     ArduGL::renderPrimitives();
 
-    Serial.write("FRAME_SEP");
-    // Serial.println(colorBufferSize + depthBufferSize);
-    // Serial.println("Color buffer: ");
-    Serial.write(colorBuffer, colorBufferSize);
-    // Serial.println();
-    // Serial.println("Depth buffer: ");
-    Serial.write(depthBuffer, depthBufferSize);
-    // Serial.println();
-    // Serial.println("Over");
-    // Serial.println();
-    Serial.flush();
+    // Serial.write("FRAME_SEP");
+    // Serial.write(colorBuffer, colorBufferSize);
+    // Serial.write(depthBuffer, depthBufferSize);
+    // Serial.flush();
+
+    glm::vec3 *glmColorBuf = reinterpret_cast<glm::vec3 *>(colorBuffer);
+    for (int x = 0; x < screenWidth; ++x)
+    {
+        for (int y = 0; y < screenHeight; ++y)
+        {
+            const int linearPixelIdx = x * screenHeight + y;
+            tft.drawPixel(x + (tft.width() / 2), y + (tft.height() / 2),
+                          glmToRGB565(*(glmColorBuf + linearPixelIdx)));
+        }
+    }
+
+    // tft.fillScreen(ST77XX_GREEN);
 
     // TODO: upscale buffers on their way out
 }
