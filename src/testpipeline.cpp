@@ -48,21 +48,21 @@ Vertex *vertexBuffer = new Vertex[6 * 6]{
 };
 
 glm::mat4 proj = glm::perspective(glm::radians(45.0), (double)screenWidth / (double)screenHeight,
-                                  0.1, 100.0);
-glm::mat4 view = glm::translate(glm::mat4(1.0), glm::vec3(0.0, 0.0, 3.0));
+                                  0.1, 1000.0);
+glm::mat4 view = glm::translate(glm::mat4(1.0), glm::vec3(0.0, 0.0, -5.0));
 
-float currentRotationDeg = 0.0;
+float runningParameter = 0.0;
 
 glm::mat4 buildModelMatrix()
 {
-    // return glm::translate(glm::identity<glm::mat4>(), glm::vec3(-2.0 + currentRotationDeg))*
-    return glm::rotate(glm::identity<glm::mat4>(), currentRotationDeg * 2.0f * glm::pi<float>(),
-                       glm::vec3(0.0, 1.0, 0.0));
+    return glm::translate(glm::identity<glm::mat4>(), glm::vec3(-1 + runningParameter))
+           * glm::rotate(glm::identity<glm::mat4>(), runningParameter * 2.0f * glm::pi<float>(),
+                         glm::vec3(0.0, 1.0, 1.0));
     //    * glm::scale(glm::identity<glm::mat4>(), glm::vec3(2.5));
-    //    * glm::rotate(glm::identity<glm::mat4>(), glm::radians(currentRotationDeg),
+    //    * glm::rotate(glm::identity<glm::mat4>(), glm::radians(runningParameter),
     //                  glm::vec3(0.0, 2.0, 0.0));
     //    * glm::scale(glm::identity<glm::mat4>(),
-    //                 glm::vec3(3.0 * glm::sin(currentRotationDeg * glm::pi<float>())));
+    //                 glm::vec3(3.0 * glm::sin(runningParameter * glm::pi<float>())));
 }
 
 glm::mat4 currentModelMatrix = buildModelMatrix();
@@ -81,7 +81,7 @@ VertexShaderOutput cubeVertexShader(const char *rawVertex /*vertex data from buf
     const glm::vec3 *vertexPos = &vertex->position;
     const glm::vec3 *vertexColor = &vertex->color;
     const glm::vec4 worldPos = currentModelMatrix
-                               * glm::vec4(vertexPos->x, vertexPos->y, vertexPos->z, 2.0);
+                               * glm::vec4(vertexPos->x, vertexPos->y, vertexPos->z, 1.0);
     const glm::vec4 transformedPos = proj * view * worldPos;
 
     return std::make_pair(transformedPos,
@@ -126,13 +126,13 @@ void initializePipeline()
 
 void drawCube()
 {
-    ArduGL::clearBuffer(ArduGL::BufferType::BT_Depth, 2.0);
-    ArduGL::clearBuffer(ArduGL::BufferType::BT_Color, 0.5);
+    ArduGL::clearBuffer(ArduGL::BufferType::BT_Depth, 1.0);
+    ArduGL::clearBuffer(ArduGL::BufferType::BT_Color, 0.2);
 
     currentModelMatrix = buildModelMatrix();
-    currentRotationDeg += 0.025;
-    if (currentRotationDeg > 1.0)
-        currentRotationDeg -= 1.0;
+    runningParameter += 0.025;
+    if (runningParameter > 1.0)
+        runningParameter -= 1.0;
 
     ArduGL::renderPrimitives();
 
@@ -141,18 +141,13 @@ void drawCube()
     Serial.write(depthBuffer, depthBufferSize);
     Serial.flush();
 
-    // uint16_t *rgb565ColorBuf = reinterpret_cast<uint16_t *>(colorBuffer);
-    // for (int x = 0; x < screenWidth; ++x)
-    // {
-    //     for (int y = 0; y < screenHeight; ++y)
-    //     {
-    //         const int linearPixelIdx = x * screenHeight + y;
-    //         tft.drawPixel(x + (tft.width() / 2), y + (tft.height() / 2),
-    //                       *(rgb565ColorBuf + linearPixelIdx));
-    //     }
-    // }
 
-    // tft.fillScreen(ST77XX_GREEN);
- 
-    // TODO: upscale buffers on their way out
+    //TODO: picture is jagged
+
+    tft.startWrite();
+    tft.setAddrWindow(tft.width() / 2, tft.height() / 2, screenWidth, screenHeight);
+    tft.writePixels(reinterpret_cast<uint16_t *>(colorBuffer), screenWidth * screenWidth, true);
+    tft.endWrite();
+
+    // TODO: upscale buffers on their way out?
 }

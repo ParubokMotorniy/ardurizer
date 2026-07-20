@@ -24,29 +24,29 @@ static void printRamInfo()
     size_t heapUsed = mi.uordblks;
     size_t stackUsed = (uintptr_t)&__StackTop - (uintptr_t)&stackMarker;
 
-    Serial.println("RAM:");
-    Serial.print("  total SRAM:   ");
-    Serial.println(RAM_SIZE);
+    //Serial.println("RAM:");
+    //Serial.print("  total SRAM:   ");
+    //Serial.println(RAM_SIZE);
 
-    Serial.print("  static used:  ");
-    Serial.println(staticUsed);
+    //Serial.print("  static used:  ");
+    //Serial.println(staticUsed);
 
-    Serial.print("  heap used:    ");
-    Serial.println(heapUsed);
+    //Serial.print("  heap used:    ");
+    //Serial.println(heapUsed);
 
-    Serial.print("  stack used:   ");
-    Serial.println(stackUsed);
+    //Serial.print("  stack used:   ");
+    //Serial.println(stackUsed);
 
-    Serial.print("  rough free:   ");
-    Serial.println(RAM_SIZE - staticUsed - heapUsed - stackUsed);
+    //Serial.print("  rough free:   ");
+    //Serial.println(RAM_SIZE - staticUsed - heapUsed - stackUsed);
 }
 
 static void printTriangleInfo(const glm::vec3 &t)
 {
-    Serial.println("Triangle info:");
-    Serial.println(t.x);
-    Serial.println(t.y);
-    Serial.println(t.z);
+    //Serial.println("Triangle info:");
+    //Serial.println(t.x);
+    //Serial.println(t.y);
+    //Serial.println(t.z);
 }
 
 struct Buffer
@@ -72,18 +72,6 @@ Buffer indexBuffer;
 Buffer colorBuffer;
 Buffer depthBuffer;
 AABB renderTargetDimensions;
- 
-// TODO: ideally, replace with vector. But that breaks everything.
-constexpr int maxRasterizedFragments = (240 / 4) * (135 / 4);
-
-struct RasterizedTriangle
-{
-    RasterizedTriangle() { fragments = new glm::vec2[maxRasterizedFragments]; }
-    ~RasterizedTriangle() { delete[] fragments; }
-
-    glm::vec2 *fragments = nullptr;
-    int count = 0;
-};
 
 uint16_t quantizeChannel(float value, uint16_t maxValue)
 {
@@ -240,15 +228,12 @@ void perspectiveDivide(glm::vec4 &clipPos)
     clipPos.z /= clipPos.w;
 }
 
-// shifts z to [0,1]
-void rescaleZ(glm::vec4 &ndcPos)
-{
-    ndcPos.z += 1.0;
-    ndcPos.z /= 2.0;
-}
-
 void mapToScreen(glm::vec4 &ndcPos)
 {
+    // shifts z to [0,1]
+    ndcPos.z += 1.0;
+    ndcPos.z /= 2.0;
+
     // shifts the viewport (not configurable)
     ndcPos.x += 1.0;
     ndcPos.x /= 2.0;
@@ -291,13 +276,14 @@ glm::vec3 computeTriCrossProduct(const glm::vec4 &v1, const glm::vec4 &v2, const
 }
 
 void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm::vec4 &v2,
-                       const glm::vec4 &v3, RasterizedTriangle &coveredFragments)
+                       const glm::vec4 &v3, std::vector<glm::vec2> &coveredFragments)
 {
     const glm::vec3 v1Pos{ v1.x, v1.y, 0 };
     const glm::vec3 v2Pos{ v2.x, v2.y, 0 };
     const glm::vec3 v3Pos{ v3.x, v3.y, 0 };
-    coveredFragments.count = 0;
+    coveredFragments.clear();
 
+    //TODO: implement top-left rule rigorously
     const int xMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blX)), 0);
     const int xMax = glm::min(static_cast<int>(glm::ceil(triangleAABB.blX + triangleAABB.width)),
                               static_cast<int>(renderTargetDimensions.width));
@@ -320,12 +306,7 @@ void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm:
                   && glm::cross(fragmentCoordinates - v3Pos, v1Pos - v3Pos).z >= 0.0;
             if (pixelCenterIsCovered)
             {
-                if (coveredFragments.count >= maxRasterizedFragments)
-                {
-                    assert(false); // TODO get rid of this and instead use dynamically sized buffers
-                    return;
-                }
-                coveredFragments.fragments[coveredFragments.count++] = glm::vec2{ x, y };
+                coveredFragments.emplace_back(x, y);
             }
         }
     }
@@ -351,13 +332,13 @@ glm::vec3 computeBarycentricCoordinates(const glm::vec2 &point, const glm::vec4 
 
 ArduGL::ReturnInfo ArduGL::renderPrimitives()
 {
-    RasterizedTriangle coveredFragments;
+    std::vector<glm::vec2> coveredFragments;
 
     for (int v = 0, totalTriangles = vertexBuffer.buffSize / (3 * vertexBuffer.itemSize);
          v < totalTriangles; ++v)
     {
-        // Serial.print("- Processing triangle: ");
-        // Serial.println(v);
+        //Serial.print("- Processing triangle: ");
+        //Serial.println(v);
 
         // primitive assembly + vertex shader
         const char *triangleAttributesStart = vertexBuffer.buffPtr + v * 3 * vertexBuffer.itemSize;
@@ -376,47 +357,48 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         perspectiveDivide(tv2.first);
         perspectiveDivide(tv3.first);
 
-        // shift z
-        rescaleZ(tv1.first);
-        rescaleZ(tv2.first);
-        rescaleZ(tv3.first);
-
-        // screen mapping
+        //TODO: Cohen–Sutherland?
+        // screen mapping + z shift
         mapToScreen(tv1.first);
         mapToScreen(tv2.first);
         mapToScreen(tv3.first);
 
         // face culling
-        if (computeTriCrossProduct(tv1.first, tv2.first, tv3.first).z <= 0.0)
+        if (computeTriCrossProduct(tv1.first, tv2.first, tv3.first).z >= 0.0)
+        {
+            //Serial.println("Face-culled triangle!");
             continue;
+        }
 
-        // Serial.println("--- Transformed triangle.");
-        // printTriangleInfo(tv1.first);
-        // printTriangleInfo(tv2.first);
-        // printTriangleInfo(tv3.first);
+        //Serial.println("--- Transformed triangle.");
+        printTriangleInfo(tv1.first);
+        printTriangleInfo(tv2.first);
+        printTriangleInfo(tv3.first);
 
         const AABB triangleAABB = computeTriangleAABB(tv1.first, tv2.first, tv3.first);
 
-        // if the traingle is out of NDC -> skip it
+        // if the triangle is out of screen -> skip it
         if (!checkAABBIntersect(renderTargetDimensions, triangleAABB))
+        {
+            //Serial.println("Triangle is out of frustrum!");
             continue;
+        }
 
         // rasterization. No need to clip against NDC frustrum sincle I clip triangle AABB against
         // it here.
         rasterizeTriangle(triangleAABB, tv1.first, tv2.first, tv3.first, coveredFragments);
 
-        // Serial.println("--- Rasterized triangle.");
-        // Serial.print("--- Total fragments covered: ");
-        // Serial.println(coveredFragments.count);
+        //Serial.println("--- Rasterized triangle.");
+        //Serial.print("--- Total fragments covered: ");
+        //Serial.println(coveredFragments.size());
 
-        for (int fragmentIndex = 0; fragmentIndex < coveredFragments.count; ++fragmentIndex)
+        for (const glm::vec2 &fragment : coveredFragments)
         {
-            const auto &fragment = coveredFragments.fragments[fragmentIndex];
             const int linearFragmentCoordinates = fragment.y * renderTargetDimensions.width
                                                   + fragment.x;
-            // Serial.println("----- Processed fragment");
-            // Serial.println(fragment.x);
-            // Serial.println(fragment.y);
+            //Serial.println("----- Processed fragment");
+            //Serial.println(fragment.x);
+            //Serial.println(fragment.y);
 
             const auto fragmentBarycentricCoordinates = computeBarycentricCoordinates(fragment,
                                                                                       tv1.first,
@@ -427,10 +409,10 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                                   1.0 / tv3.first.w);
             const float oneOverW = glm::dot(fragmentBarycentricCoordinates, oneOverWs);
 
-            // Serial.println("----- Computed barycentrics");
-            // Serial.println(fragmentBarycentricCoordinates.x);
-            // Serial.println(fragmentBarycentricCoordinates.y);
-            // Serial.println(fragmentBarycentricCoordinates.z);
+            //Serial.println("----- Computed barycentrics");
+            //Serial.println(fragmentBarycentricCoordinates.x);
+            //Serial.println(fragmentBarycentricCoordinates.y);
+            //Serial.println(fragmentBarycentricCoordinates.z);
 
             // depth processing
             {
@@ -442,14 +424,14 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                                             glm::vec3(tv1.first.z, tv2.first.z,
                                                                       tv3.first.z));
 
-                // Serial.println("----- Computed depth");
-                // Serial.println(currentNonLinearDepth);
+                //Serial.println("----- Computed depth");
+                //Serial.println(currentNonLinearDepth);
 
-                if (currentNonLinearDepth <= storedDepth)
+                if (currentNonLinearDepth >= storedDepth)
                     continue;
 
                 *depthBufPtr = currentNonLinearDepth;
-                // Serial.println("------ Wrote depth");
+                //Serial.println("------ Wrote depth");
             }
 
             // color processing
@@ -464,17 +446,17 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                  glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a]) * oneOverWs)
                         / oneOverW);
                 }
-                // Serial.println("----- Interpolated attributes");
+                //Serial.println("----- Interpolated attributes");
 
                 const glm::vec3 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
-                // Serial.println("----- Computed color");
-                // printTriangleInfo(fragmentOutput);
+                //Serial.println("----- Computed color");
+                printTriangleInfo(fragmentOutput);
 
                 uint16_t *colorBufPtr = reinterpret_cast<uint16_t *>(colorBuffer.buffPtr)
                                         + linearFragmentCoordinates;
 
                 *colorBufPtr = packRGB565(fragmentOutput);
-                // Serial.println("------ Wrote color");
+                //Serial.println("------ Wrote color");
             }
         }
     }
