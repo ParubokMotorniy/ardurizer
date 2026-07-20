@@ -7,6 +7,7 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #include <Arduino.h>
+#include <cstdint>
 #include <vector>
 
 #undef radians
@@ -14,16 +15,13 @@
 namespace
 {
 
-constexpr int screenWidth = 240 / 8;
-constexpr int screenHeight = 135 / 8;
-
-// TODO: rework API to allow integers as color/depth valus to fit more of them and increase
-// resolution. Embedded screens won't let one tell the difference anyway.
+constexpr int screenWidth = 240 / 4;
+constexpr int screenHeight = 135 / 4;
 
 constexpr int depthBufferSize = screenWidth * screenHeight * sizeof(float);
 char *depthBuffer = new char[depthBufferSize];
 
-constexpr int colorBufferSize = screenWidth * screenHeight * sizeof(glm::vec3);
+constexpr int colorBufferSize = screenWidth * screenHeight * sizeof(uint16_t);
 char *colorBuffer = new char[colorBufferSize];
 
 struct Vertex
@@ -71,19 +69,6 @@ glm::mat4 currentModelMatrix = buildModelMatrix();
 
 Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 12, /*MOSI*/ 11, /*SCK*/ 13);
 
-uint16_t glmToRGB565(const glm::vec3 &fullColor)
-{
-    constexpr uint16_t max5BitColor = 31;
-    constexpr uint16_t max6BitColor = 63;
-
-    const uint16_t red = fullColor.r * max5BitColor;
-    const uint16_t green = fullColor.g * max6BitColor;
-    const uint16_t blue = fullColor.b * max5BitColor;
-
-    const uint16_t color565 = (red << (5 + 6)) | (green << 5) | blue;
-    return color565;
-}
-
 } // namespace
 
 using VertexShaderOutput
@@ -116,7 +101,7 @@ void initializePipeline()
 
     ArduGL::bindBuffer(ArduGL::BufferType::BT_Depth, depthBuffer, depthBufferSize, sizeof(float));
     ArduGL::bindBuffer(ArduGL::BufferType::BT_Color, colorBuffer, colorBufferSize,
-                       sizeof(glm::vec3));
+                       sizeof(uint16_t));
     ArduGL::bindBuffer(ArduGL::BufferType::BT_VertexAttribute,
                        reinterpret_cast<char *>(vertexBuffer), vertexBufferSize, sizeof(Vertex));
 
@@ -151,23 +136,23 @@ void drawCube()
 
     ArduGL::renderPrimitives();
 
-    // Serial.write("FRAME_SEP");
-    // Serial.write(colorBuffer, colorBufferSize);
-    // Serial.write(depthBuffer, depthBufferSize);
-    // Serial.flush();
+    Serial.write("FRAME_SEP");
+    Serial.write(colorBuffer, colorBufferSize);
+    Serial.write(depthBuffer, depthBufferSize);
+    Serial.flush();
 
-    glm::vec3 *glmColorBuf = reinterpret_cast<glm::vec3 *>(colorBuffer);
-    for (int x = 0; x < screenWidth; ++x)
-    {
-        for (int y = 0; y < screenHeight; ++y)
-        {
-            const int linearPixelIdx = x * screenHeight + y;
-            tft.drawPixel(x + (tft.width() / 2), y + (tft.height() / 2),
-                          glmToRGB565(*(glmColorBuf + linearPixelIdx)));
-        }
-    }
+    // uint16_t *rgb565ColorBuf = reinterpret_cast<uint16_t *>(colorBuffer);
+    // for (int x = 0; x < screenWidth; ++x)
+    // {
+    //     for (int y = 0; y < screenHeight; ++y)
+    //     {
+    //         const int linearPixelIdx = x * screenHeight + y;
+    //         tft.drawPixel(x + (tft.width() / 2), y + (tft.height() / 2),
+    //                       *(rgb565ColorBuf + linearPixelIdx));
+    //     }
+    // }
 
     // tft.fillScreen(ST77XX_GREEN);
-
+ 
     // TODO: upscale buffers on their way out
 }

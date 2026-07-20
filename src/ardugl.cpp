@@ -4,6 +4,7 @@
 
 #include <Arduino.h>
 
+#include <cstdint>
 #include <cstring>
 #include <malloc.h>
 #include <vector>
@@ -71,9 +72,9 @@ Buffer indexBuffer;
 Buffer colorBuffer;
 Buffer depthBuffer;
 AABB renderTargetDimensions;
-
+ 
 // TODO: ideally, replace with vector. But that breaks everything.
-constexpr int maxRasterizedFragments = (240 / 8) * (135 / 8);
+constexpr int maxRasterizedFragments = (240 / 4) * (135 / 4);
 
 struct RasterizedTriangle
 {
@@ -84,7 +85,26 @@ struct RasterizedTriangle
     int count = 0;
 };
 
-ArduGL::ReturnInfo ArduGL::clearBuffer(BufferType buffType, char clearValue)
+uint16_t quantizeChannel(float value, uint16_t maxValue)
+{
+    if (!(value >= 0.0f))
+        return 0;
+    if (value > 1.0f)
+        value = 1.0f;
+
+    return static_cast<uint16_t>(value * static_cast<float>(maxValue) + 0.5f);
+}
+
+uint16_t packRGB565(const glm::vec3 &color)
+{
+    const uint16_t red = quantizeChannel(color.r, 31);
+    const uint16_t green = quantizeChannel(color.g, 63);
+    const uint16_t blue = quantizeChannel(color.b, 31);
+
+    return static_cast<uint16_t>((red << 11) | (green << 5) | blue);
+}
+
+ArduGL::ReturnInfo ArduGL::clearBuffer(BufferType buffType, float clearValue)
 {
     switch (buffType)
     {
@@ -92,11 +112,22 @@ ArduGL::ReturnInfo ArduGL::clearBuffer(BufferType buffType, char clearValue)
     case BufferType::BT_VertexIndex:
         return ReturnInfo{ false, EC_InvalidOperation };
     case BufferType::BT_Depth:
-        std::memset(depthBuffer.buffPtr, clearValue, depthBuffer.buffSize);
+    {
+        float *depthValues = reinterpret_cast<float *>(depthBuffer.buffPtr);
+        const int depthValueCount = depthBuffer.buffSize / depthBuffer.itemSize;
+        for (int i = 0; i < depthValueCount; ++i)
+            depthValues[i] = clearValue;
         break;
+    }
     case BufferType::BT_Color:
-        std::memset(colorBuffer.buffPtr, clearValue, colorBuffer.buffSize);
+    {
+        uint16_t *colorValues = reinterpret_cast<uint16_t *>(colorBuffer.buffPtr);
+        const int colorValueCount = colorBuffer.buffSize / colorBuffer.itemSize;
+        const uint16_t packedColor = packRGB565(glm::vec3(clearValue));
+        for (int i = 0; i < colorValueCount; ++i)
+            colorValues[i] = packedColor;
         break;
+    }
     default:
         return ReturnInfo{ false, EC_UnsupportedBufferType };
     }
@@ -439,11 +470,10 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                 // Serial.println("----- Computed color");
                 // printTriangleInfo(fragmentOutput);
 
-                // TODO: formalize this convention and absence of alpha support
-                glm::vec3 *colorBufPtr = reinterpret_cast<glm::vec3 *>(colorBuffer.buffPtr)
-                                         + linearFragmentCoordinates;
+                uint16_t *colorBufPtr = reinterpret_cast<uint16_t *>(colorBuffer.buffPtr)
+                                        + linearFragmentCoordinates;
 
-                *colorBufPtr = fragmentOutput;
+                *colorBufPtr = packRGB565(fragmentOutput);
                 // Serial.println("------ Wrote color");
             }
         }

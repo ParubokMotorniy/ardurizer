@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert marked RGB-float + depth-float frame dumps into PNGs or GIFs."""
+"""Convert marked RGB565 + depth-float frame dumps into PNGs or GIFs."""
 
 from __future__ import annotations
 
@@ -27,14 +27,25 @@ def unpack_floats(data: bytes, endian: str) -> tuple[float, ...]:
     return struct.unpack(f"{prefix}{len(data) // 4}f", data)
 
 
-def make_color_pixels(values: tuple[float, ...], width: int, height: int) -> bytes:
+def unpack_rgb565(data: bytes, endian: str) -> tuple[int, ...]:
+    prefix = "<" if endian == "little" else ">"
+    return struct.unpack(f"{prefix}{len(data) // 2}H", data)
+
+
+def expand_5_to_8(value: int) -> int:
+    return (value << 3) | (value >> 2)
+
+
+def expand_6_to_8(value: int) -> int:
+    return (value << 2) | (value >> 4)
+
+
+def make_color_pixels(values: tuple[int, ...]) -> bytes:
     pixels = bytearray()
-    cursor = 0
-    for _ in range(width * height):
-        pixels.append(clamp_byte(values[cursor]))
-        pixels.append(clamp_byte(values[cursor + 1]))
-        pixels.append(clamp_byte(values[cursor + 2]))
-        cursor += 3
+    for value in values:
+        pixels.append(expand_5_to_8((value >> 11) & 0x1F))
+        pixels.append(expand_6_to_8((value >> 5) & 0x3F))
+        pixels.append(expand_5_to_8(value & 0x1F))
     return bytes(pixels)
 
 
@@ -77,13 +88,13 @@ def make_frame_images(
     color_data = frame_data[:depth_offset]
     depth_data = frame_data[depth_offset : depth_offset + depth_buffer_size]
 
-    color_values = unpack_floats(color_data, endian)
+    color_values = unpack_rgb565(color_data, endian)
     depth_values = unpack_floats(depth_data, endian)
 
     color_image = Image.frombytes(
         "RGB",
         (width, height),
-        make_color_pixels(color_values, width, height),
+        make_color_pixels(color_values),
     )
     depth_image = Image.frombytes(
         "L",
@@ -125,7 +136,7 @@ def split_marked_frames(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Convert a frame dump containing RGB float32 pixels followed by "
+            "Convert a frame dump containing RGB565 pixels followed by "
             "float32 depth values into color and grayscale depth images. "
             "Each frame must start with the separator word. One complete frame "
             "writes PNGs; multiple complete frames write GIFs."
@@ -148,7 +159,7 @@ def parse_args() -> argparse.Namespace:
         "--endian",
         choices=("little", "big"),
         default="little",
-        help="float byte order in the dump file, default: little",
+        help="RGB565 and float byte order in the dump file, default: little",
     )
     parser.add_argument(
         "--duration",
@@ -174,7 +185,7 @@ def main() -> int:
         return 2
 
     pixel_count = args.width * args.height
-    color_buffer_size = pixel_count * 3 * 4
+    color_buffer_size = pixel_count * 2
     depth_buffer_size = pixel_count * 4
     expected_bytes = color_buffer_size + depth_buffer_size
 

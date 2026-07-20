@@ -32,7 +32,8 @@ struct ReturnInfo
 
 // buffer management
 
-ReturnInfo clearBuffer(BufferType buffType, char clearValue = 0);
+ReturnInfo clearBuffer(BufferType buffType, float clearValue = 0.0f);
+// BT_Color stores one RGB565 uint16_t per pixel. Fragment shaders still return float RGB.
 ReturnInfo bindBuffer(BufferType buffType, char *buffPtr, int buffSize, int itemSize);
 ReturnInfo unbindBuffer(BufferType buffType);
 ReturnInfo setRenderTargetDimensions(int width, int height);
