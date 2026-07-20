@@ -250,6 +250,15 @@ bool checkAABBIntersect(const AABB &b1, const AABB &b2)
     return !noIntersection;
 }
 
+glm::vec3 computeTriCrossProduct(const glm::vec4 &v1, const glm::vec4 &v2, const glm::vec4 &v3)
+{
+    const glm::vec3 v1Pos{ v1.x, v1.y, 0 };
+    const glm::vec3 v2Pos{ v2.x, v2.y, 0 };
+    const glm::vec3 v3Pos{ v3.x, v3.y, 0 };
+
+    return glm::cross(v2Pos - v1Pos, v3Pos - v1Pos);
+}
+
 void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm::vec4 &v2,
                        const glm::vec4 &v3, RasterizedTriangle &coveredFragments)
 {
@@ -336,9 +345,6 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         perspectiveDivide(tv2.first);
         perspectiveDivide(tv3.first);
 
-        // TODO: NDC clipping
-        // TODO: face culling
-
         // shift z
         rescaleZ(tv1.first);
         rescaleZ(tv2.first);
@@ -348,6 +354,10 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         mapToScreen(tv1.first);
         mapToScreen(tv2.first);
         mapToScreen(tv3.first);
+
+        // face culling
+        if (computeTriCrossProduct(tv1.first, tv2.first, tv3.first).z <= 0.0)
+            continue;
 
         // Serial.println("--- Transformed triangle.");
         // printTriangleInfo(tv1.first);
@@ -360,7 +370,8 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         if (!checkAABBIntersect(renderTargetDimensions, triangleAABB))
             continue;
 
-        // rasterization
+        // rasterization. No need to clip against NDC frustrum sincle I clip triangle AABB against
+        // it here.
         rasterizeTriangle(triangleAABB, tv1.first, tv2.first, tv3.first, coveredFragments);
 
         // Serial.println("--- Rasterized triangle.");
