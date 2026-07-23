@@ -1,13 +1,17 @@
 #pragma once
 
+// TODO: add asserts in the definition code to verify the most important assumptions of the API +
+// return proper error codes for release builds
+// TODO: sweep over the API to improve it from usability perspective
+
 namespace ArduGL
 {
 enum BufferType
 {
     BT_VertexAttribute,
     BT_VertexIndex,
-    BT_Depth,
-    BT_Color,
+    BT_Depth /*expected as a single 4-byte float per pixel*/,
+    BT_Color /*expected as a single RGB16 value per pixel*/,
 };
 
 enum ShaderType

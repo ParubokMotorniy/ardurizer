@@ -9,6 +9,10 @@
 #include <malloc.h>
 #include <vector>
 
+// undef Arduino helpers - got my own (well, glm's)
+#undef abs
+#undef radians
+
 extern char __HeapBase;
 extern char __StackTop;
 
@@ -24,29 +28,29 @@ static void printRamInfo()
     size_t heapUsed = mi.uordblks;
     size_t stackUsed = (uintptr_t)&__StackTop - (uintptr_t)&stackMarker;
 
-    //Serial.println("RAM:");
-    //Serial.print("  total SRAM:   ");
-    //Serial.println(RAM_SIZE);
+    // Serial.println("RAM:");
+    // Serial.print("  total SRAM:   ");
+    // Serial.println(RAM_SIZE);
 
-    //Serial.print("  static used:  ");
-    //Serial.println(staticUsed);
+    // Serial.print("  static used:  ");
+    // Serial.println(staticUsed);
 
-    //Serial.print("  heap used:    ");
-    //Serial.println(heapUsed);
+    // Serial.print("  heap used:    ");
+    // Serial.println(heapUsed);
 
-    //Serial.print("  stack used:   ");
-    //Serial.println(stackUsed);
+    // Serial.print("  stack used:   ");
+    // Serial.println(stackUsed);
 
-    //Serial.print("  rough free:   ");
-    //Serial.println(RAM_SIZE - staticUsed - heapUsed - stackUsed);
+    // Serial.print("  rough free:   ");
+    // Serial.println(RAM_SIZE - staticUsed - heapUsed - stackUsed);
 }
 
 static void printTriangleInfo(const glm::vec3 &t)
 {
-    //Serial.println("Triangle info:");
-    //Serial.println(t.x);
-    //Serial.println(t.y);
-    //Serial.println(t.z);
+    // Serial.println("Triangle info:");
+    // Serial.println(t.x);
+    // Serial.println(t.y);
+    // Serial.println(t.z);
 }
 
 struct Buffer
@@ -283,29 +287,91 @@ void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm:
     const glm::vec3 v3Pos{ v3.x, v3.y, 0 };
     coveredFragments.clear();
 
-    //TODO: implement top-left rule rigorously
     const int xMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blX)), 0);
     const int xMax = glm::min(static_cast<int>(glm::ceil(triangleAABB.blX + triangleAABB.width)),
                               static_cast<int>(renderTargetDimensions.width));
+
     const int yMin = glm::max(static_cast<int>(glm::ceil(triangleAABB.blY)), 0);
     const int yMax = glm::min(static_cast<int>(glm::ceil(triangleAABB.blY + triangleAABB.height)),
                               static_cast<int>(renderTargetDimensions.height));
 
+    constexpr float epsilon = 1.0e-6;
+
     if (xMin >= xMax || yMin >= yMax)
         return;
 
-    for (int x = xMin; x < xMax; ++x)
+    for (int x = xMin + 0.5; x < xMax; ++x)
     {
-        for (int y = yMin; y < yMax; ++y)
+        for (int y = yMin + 0.5; y < yMax; ++y)
         {
             const glm::vec3 fragmentCoordinates{ x, y, 0.0 };
 
-            const bool pixelCenterIsCovered
-                = glm::cross(fragmentCoordinates - v1Pos, v2Pos - v1Pos).z >= 0.0
-                  && glm::cross(fragmentCoordinates - v2Pos, v3Pos - v2Pos).z >= 0.0
-                  && glm::cross(fragmentCoordinates - v3Pos, v1Pos - v3Pos).z >= 0.0;
-            if (pixelCenterIsCovered)
+            const float crossEdge1 = glm::cross(fragmentCoordinates - v1Pos, v2Pos - v1Pos).z;
+            const float crossEdge2 = glm::cross(fragmentCoordinates - v2Pos, v3Pos - v2Pos).z;
+            const float crossEdge3 = glm::cross(fragmentCoordinates - v3Pos, v1Pos - v3Pos).z;
+
+            const bool pixelCenterIsInside = crossEdge1 > epsilon && crossEdge2 > epsilon
+                                             && crossEdge3 > epsilon;
+            if (pixelCenterIsInside)
             {
+                coveredFragments.emplace_back(x, y);
+            }
+            else
+            {
+                {
+                    if (crossEdge1 < 0.0)
+                        continue; // pixel is beyond one of the edges
+
+                    const bool pixelBelongsToEdge1 = crossEdge1 > 0 && crossEdge1 < epsilon;
+                    if (pixelBelongsToEdge1)
+                    {
+                        const bool edgeIsLeftOrTop
+                            = (/*top ~ close to horizontal*/ glm::abs(v1Pos.y - v2Pos.y) < epsilon
+                               && v1Pos.y > v3Pos.y && v2Pos.y > v3Pos.y)
+                              || (/*left ~ not top and one of coordinates is smallest along x*/ (
+                                      v1Pos.x < v2Pos.x && v1Pos.x < v3Pos.x)
+                                  || (v2Pos.x < v1Pos.x && v2Pos.x < v3Pos.x));
+                        if (!edgeIsLeftOrTop)
+                            continue; // top-left rule is broken
+                    }
+                }
+
+                {
+                    if (crossEdge2 < 0.0)
+                        continue; // pixel is beyond one of the edges
+
+                    const bool pixelBelongsToEdge2 = crossEdge2 > 0 && crossEdge2 < epsilon;
+                    if (pixelBelongsToEdge2)
+                    {
+                        const bool edgeIsLeftOrTop
+                            = (/*top ~ close to horizontal*/ glm::abs(v2Pos.y - v3Pos.y) < epsilon
+                               && v2Pos.y > v1Pos.y && v3Pos.y > v1Pos.y)
+                              || (/*left ~ not top and one of coordinates is smallest along x*/ (
+                                      v2Pos.x < v1Pos.x && v2Pos.x < v3Pos.x)
+                                  || (v3Pos.x < v1Pos.x && v3Pos.x < v2Pos.x));
+                        if (!edgeIsLeftOrTop)
+                            continue; // top-left rule is broken
+                    }
+                }
+
+                {
+                    if (crossEdge3 < 0.0)
+                        continue; // pixel is beyond one of the edges
+
+                    const bool pixelBelongsToEdge3 = crossEdge3 > 0 && crossEdge3 < epsilon;
+                    if (pixelBelongsToEdge3)
+                    {
+                        const bool edgeIsLeftOrTop
+                            = (/*top ~ close to horizontal*/ glm::abs(v1Pos.y - v3Pos.y) < epsilon
+                               && v1Pos.y > v2Pos.y && v3Pos.y > v2Pos.y)
+                              || (/*left ~ not top and one of coordinates is smallest along x*/ (
+                                      v1Pos.x < v2Pos.x && v1Pos.x < v3Pos.x)
+                                  || (v3Pos.x < v2Pos.x && v3Pos.x < v1Pos.x));
+                        if (!edgeIsLeftOrTop)
+                            continue; // top-left rule is broken
+                    }
+                }
+
                 coveredFragments.emplace_back(x, y);
             }
         }
@@ -337,8 +403,8 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
     for (int v = 0, totalTriangles = vertexBuffer.buffSize / (3 * vertexBuffer.itemSize);
          v < totalTriangles; ++v)
     {
-        //Serial.print("- Processing triangle: ");
-        //Serial.println(v);
+        // Serial.print("- Processing triangle: ");
+        // Serial.println(v);
 
         // primitive assembly + vertex shader
         const char *triangleAttributesStart = vertexBuffer.buffPtr + v * 3 * vertexBuffer.itemSize;
@@ -357,8 +423,8 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         perspectiveDivide(tv2.first);
         perspectiveDivide(tv3.first);
 
-        //TODO: Cohen–Sutherland?
-        // screen mapping + z shift
+        // TODO: Cohen–Sutherland?
+        //  screen mapping + z shift
         mapToScreen(tv1.first);
         mapToScreen(tv2.first);
         mapToScreen(tv3.first);
@@ -366,11 +432,11 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         // face culling
         if (computeTriCrossProduct(tv1.first, tv2.first, tv3.first).z >= 0.0)
         {
-            //Serial.println("Face-culled triangle!");
+            // Serial.println("Face-culled triangle!");
             continue;
         }
 
-        //Serial.println("--- Transformed triangle.");
+        // Serial.println("--- Transformed triangle.");
         printTriangleInfo(tv1.first);
         printTriangleInfo(tv2.first);
         printTriangleInfo(tv3.first);
@@ -380,7 +446,7 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         // if the triangle is out of screen -> skip it
         if (!checkAABBIntersect(renderTargetDimensions, triangleAABB))
         {
-            //Serial.println("Triangle is out of frustrum!");
+            // Serial.println("Triangle is out of frustrum!");
             continue;
         }
 
@@ -388,17 +454,17 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
         // it here.
         rasterizeTriangle(triangleAABB, tv1.first, tv2.first, tv3.first, coveredFragments);
 
-        //Serial.println("--- Rasterized triangle.");
-        //Serial.print("--- Total fragments covered: ");
-        //Serial.println(coveredFragments.size());
+        // Serial.println("--- Rasterized triangle.");
+        // Serial.print("--- Total fragments covered: ");
+        // Serial.println(coveredFragments.size());
 
         for (const glm::vec2 &fragment : coveredFragments)
         {
             const int linearFragmentCoordinates = fragment.y * renderTargetDimensions.width
                                                   + fragment.x;
-            //Serial.println("----- Processed fragment");
-            //Serial.println(fragment.x);
-            //Serial.println(fragment.y);
+            // Serial.println("----- Processed fragment");
+            // Serial.println(fragment.x);
+            // Serial.println(fragment.y);
 
             const auto fragmentBarycentricCoordinates = computeBarycentricCoordinates(fragment,
                                                                                       tv1.first,
@@ -409,14 +475,13 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                                   1.0 / tv3.first.w);
             const float oneOverW = glm::dot(fragmentBarycentricCoordinates, oneOverWs);
 
-            //Serial.println("----- Computed barycentrics");
-            //Serial.println(fragmentBarycentricCoordinates.x);
-            //Serial.println(fragmentBarycentricCoordinates.y);
-            //Serial.println(fragmentBarycentricCoordinates.z);
+            // Serial.println("----- Computed barycentrics");
+            // Serial.println(fragmentBarycentricCoordinates.x);
+            // Serial.println(fragmentBarycentricCoordinates.y);
+            // Serial.println(fragmentBarycentricCoordinates.z);
 
             // depth processing
             {
-                // TODO: formalize this convention
                 float *depthBufPtr = reinterpret_cast<float *>(depthBuffer.buffPtr)
                                      + linearFragmentCoordinates;
                 const auto storedDepth = *depthBufPtr;
@@ -424,14 +489,14 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                                             glm::vec3(tv1.first.z, tv2.first.z,
                                                                       tv3.first.z));
 
-                //Serial.println("----- Computed depth");
-                //Serial.println(currentNonLinearDepth);
+                // Serial.println("----- Computed depth");
+                // Serial.println(currentNonLinearDepth);
 
                 if (currentNonLinearDepth >= storedDepth)
                     continue;
 
                 *depthBufPtr = currentNonLinearDepth;
-                //Serial.println("------ Wrote depth");
+                // Serial.println("------ Wrote depth");
             }
 
             // color processing
@@ -446,17 +511,17 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                                  glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a]) * oneOverWs)
                         / oneOverW);
                 }
-                //Serial.println("----- Interpolated attributes");
+                // Serial.println("----- Interpolated attributes");
 
                 const glm::vec3 fragmentOutput = fragmentShaderPtr(interpolatedAttributes);
-                //Serial.println("----- Computed color");
+                // Serial.println("----- Computed color");
                 printTriangleInfo(fragmentOutput);
 
                 uint16_t *colorBufPtr = reinterpret_cast<uint16_t *>(colorBuffer.buffPtr)
                                         + linearFragmentCoordinates;
 
                 *colorBufPtr = packRGB565(fragmentOutput);
-                //Serial.println("------ Wrote color");
+                // Serial.println("------ Wrote color");
             }
         }
     }
