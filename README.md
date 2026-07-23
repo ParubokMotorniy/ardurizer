@@ -13,8 +13,8 @@ Buffer size: 5,6 KiB (0.17 of RAM);
 
 Res: 60x33;      
 Format: RGB16;      
-Buffer size: 3,8 KiB (0.12 of RAM);   
+Buffer size: 3,8 KiB (0.12 of RAM);
 
-<img width="600" height="330" alt="test_all_color" src="https://github.com/user-attachments/assets/dc8ffa1b-88a1-42f2-b7ff-aa062edfe724" />
+<img width="600" height="330" alt="test_all_en_color" src="https://github.com/user-attachments/assets/dee68f2f-2543-4b4c-b079-a125c5584dbf" />
 
 ---
