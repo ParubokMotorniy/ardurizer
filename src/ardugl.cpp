@@ -300,11 +300,12 @@ void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm:
     if (xMin >= xMax || yMin >= yMax)
         return;
 
-    for (int x = xMin + 0.5; x < xMax; ++x)
+    for (int x = xMin; x < xMax; ++x)
     {
-        for (int y = yMin + 0.5; y < yMax; ++y)
+        for (int y = yMin; y < yMax; ++y)
         {
-            const glm::vec3 fragmentCoordinates{ x, y, 0.0 };
+            const glm::vec3 fragmentCoordinates{ static_cast<float>(x) + 0.5f,
+                                                 static_cast<float>(y) + 0.5f, 0.0 };
 
             const float crossEdge1 = glm::cross(fragmentCoordinates - v1Pos, v2Pos - v1Pos).z;
             const float crossEdge2 = glm::cross(fragmentCoordinates - v2Pos, v3Pos - v2Pos).z;
@@ -314,7 +315,7 @@ void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm:
                                              && crossEdge3 > epsilon;
             if (pixelCenterIsInside)
             {
-                coveredFragments.emplace_back(x, y);
+                coveredFragments.emplace_back(static_cast<float>(x), static_cast<float>(y));
             }
             else
             {
@@ -372,7 +373,7 @@ void rasterizeTriangle(const AABB &triangleAABB, const glm::vec4 &v1, const glm:
                     }
                 }
 
-                coveredFragments.emplace_back(x, y);
+                coveredFragments.emplace_back(static_cast<float>(x), static_cast<float>(y));
             }
         }
     }
@@ -460,16 +461,19 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
 
         for (const glm::vec2 &fragment : coveredFragments)
         {
-            const int linearFragmentCoordinates = fragment.y * renderTargetDimensions.width
-                                                  + fragment.x;
+            const int fragmentX = static_cast<int>(fragment.x);
+            const int fragmentY = static_cast<int>(fragment.y);
+            const int linearFragmentCoordinates = fragmentY
+                                                      * static_cast<int>(renderTargetDimensions.width)
+                                                  + fragmentX;
             // Serial.println("----- Processed fragment");
             // Serial.println(fragment.x);
             // Serial.println(fragment.y);
 
-            const auto fragmentBarycentricCoordinates = computeBarycentricCoordinates(fragment,
-                                                                                      tv1.first,
-                                                                                      tv2.first,
-                                                                                      tv3.first);
+            const glm::vec2 fragmentCenter{ static_cast<float>(fragmentX) + 0.5f,
+                                            static_cast<float>(fragmentY) + 0.5f };
+            const auto fragmentBarycentricCoordinates
+                = computeBarycentricCoordinates(fragmentCenter, tv1.first, tv2.first, tv3.first);
 
             const glm::vec3 oneOverWs = glm::vec3(1.0 / tv1.first.w, 1.0 / tv2.first.w,
                                                   1.0 / tv3.first.w);

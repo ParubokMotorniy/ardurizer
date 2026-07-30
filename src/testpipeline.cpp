@@ -112,6 +112,7 @@ void initializePipeline()
     Serial.begin(115200, SERIAL_8N1);
 
     tft.init(135, 240);
+    tft.setRotation(1);
     tft.fillScreen(ST77XX_GREEN);
     delay(500);
     tft.fillScreen(ST77XX_BLUE);
@@ -141,13 +142,16 @@ void drawCube()
     Serial.write(depthBuffer, depthBufferSize);
     Serial.flush();
 
-
-    //TODO: picture is jagged
+    // TODO: picture is jagged
 
     tft.startWrite();
-    tft.setAddrWindow(tft.width() / 2, tft.height() / 2, screenWidth, screenHeight);
-    tft.writePixels(reinterpret_cast<uint16_t *>(colorBuffer), screenWidth * screenWidth, true);
+    const int renderTargetX = (tft.width() - screenWidth) / 2;
+    const int renderTargetY = (tft.height() - screenHeight) / 2;
+
+    tft.setAddrWindow(renderTargetX, renderTargetY, screenWidth, screenHeight);
+    tft.writePixels(reinterpret_cast<uint16_t *>(colorBuffer), screenWidth * screenHeight, true);
     tft.endWrite();
 
-    // TODO: upscale buffers on their way out?
+    // TODO: upscale buffers on their way out? OR keep the buffers in flsah for increased storage ->
+    // with reads/writes to flash, it's effectively mobile tile rendering
 }
