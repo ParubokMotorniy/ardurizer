@@ -9,6 +9,9 @@
 #include <malloc.h>
 #include <vector>
 
+// TODO: go over the API and prettify it: add key assertions, export depth/clor types, resolve
+// inconsistencies.
+
 // undef Arduino helpers - got my own (well, glm's)
 #undef abs
 #undef radians
@@ -96,6 +99,13 @@ uint16_t packRGB565(const glm::vec3 &color)
     return static_cast<uint16_t>((red << 11) | (green << 5) | blue);
 }
 
+// TODO: adjust postporcessing script to new depth convention
+unsigned char packDepthIntoByte(float depth)
+{
+    assert(depth <= 1.0 && depth >= 0.0);
+    return static_cast<unsigned char>(depth * 255.0);
+}
+
 ArduGL::ReturnInfo ArduGL::clearBuffer(BufferType buffType, float clearValue)
 {
     switch (buffType)
@@ -105,10 +115,11 @@ ArduGL::ReturnInfo ArduGL::clearBuffer(BufferType buffType, float clearValue)
         return ReturnInfo{ false, EC_InvalidOperation };
     case BufferType::BT_Depth:
     {
-        float *depthValues = reinterpret_cast<float *>(depthBuffer.buffPtr);
+        unsigned char *depthValues = reinterpret_cast<unsigned char *>(depthBuffer.buffPtr);
         const int depthValueCount = depthBuffer.buffSize / depthBuffer.itemSize;
+        const unsigned char depthClearValue = packDepthIntoByte(clearValue);
         for (int i = 0; i < depthValueCount; ++i)
-            depthValues[i] = clearValue;
+            depthValues[i] = depthClearValue;
         break;
     }
     case BufferType::BT_Color:
@@ -464,7 +475,8 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
             const int fragmentX = static_cast<int>(fragment.x);
             const int fragmentY = static_cast<int>(fragment.y);
             const int linearFragmentCoordinates = fragmentY
-                                                      * static_cast<int>(renderTargetDimensions.width)
+                                                      * static_cast<int>(
+                                                          renderTargetDimensions.width)
                                                   + fragmentX;
             // Serial.println("----- Processed fragment");
             // Serial.println(fragment.x);
@@ -486,9 +498,10 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
 
             // depth processing
             {
-                float *depthBufPtr = reinterpret_cast<float *>(depthBuffer.buffPtr)
-                                     + linearFragmentCoordinates;
-                const auto storedDepth = *depthBufPtr;
+                unsigned char *depthBufPtr = reinterpret_cast<unsigned char *>(depthBuffer.buffPtr)
+                                             + linearFragmentCoordinates;
+                const float storedDepth = *depthBufPtr / 255.0;
+
                 const auto currentNonLinearDepth = glm::dot(fragmentBarycentricCoordinates,
                                                             glm::vec3(tv1.first.z, tv2.first.z,
                                                                       tv3.first.z));
@@ -499,7 +512,7 @@ ArduGL::ReturnInfo ArduGL::renderPrimitives()
                 if (currentNonLinearDepth >= storedDepth)
                     continue;
 
-                *depthBufPtr = currentNonLinearDepth;
+                *depthBufPtr = packDepthIntoByte(currentNonLinearDepth);
                 // Serial.println("------ Wrote depth");
             }
 

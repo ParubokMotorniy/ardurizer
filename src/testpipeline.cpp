@@ -18,7 +18,7 @@ namespace
 constexpr int screenWidth = 240 / 4;
 constexpr int screenHeight = 135 / 4;
 
-constexpr int depthBufferSize = screenWidth * screenHeight * sizeof(float);
+constexpr int depthBufferSize = screenWidth * screenHeight * sizeof(unsigned char);
 char *depthBuffer = new char[depthBufferSize];
 
 constexpr int colorBufferSize = screenWidth * screenHeight * sizeof(uint16_t);
@@ -99,7 +99,8 @@ void initializePipeline()
 {
     ArduGL::setRenderTargetDimensions(screenWidth, screenHeight);
 
-    ArduGL::bindBuffer(ArduGL::BufferType::BT_Depth, depthBuffer, depthBufferSize, sizeof(float));
+    ArduGL::bindBuffer(ArduGL::BufferType::BT_Depth, depthBuffer, depthBufferSize,
+                       sizeof(unsigned char));
     ArduGL::bindBuffer(ArduGL::BufferType::BT_Color, colorBuffer, colorBufferSize,
                        sizeof(uint16_t));
     ArduGL::bindBuffer(ArduGL::BufferType::BT_VertexAttribute,
