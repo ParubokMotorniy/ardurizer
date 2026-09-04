@@ -10,6 +10,8 @@
 #include <cstdint>
 #include <vector>
 
+#define ENABLE_SERIAL_FRAME_DUMP 0
+
 #undef radians
 
 namespace
@@ -110,8 +112,6 @@ void initializePipeline()
     ArduGL::bindShader(ArduGL::ShaderType::ST_Fragment,
                        reinterpret_cast<void *>(&cubeFragmentShader));
 
-    Serial.begin(115200, SERIAL_8N1);
-
     tft.init(135, 240);
     tft.setRotation(1);
     tft.fillScreen(ST77XX_GREEN);
@@ -122,8 +122,12 @@ void initializePipeline()
     delay(500);
     tft.fillScreen(ST77XX_BLACK);
 
+#if ENABLE_SERIAL_FRAME_DUMP
+    Serial.begin(115200, SERIAL_8N1);
+#endif
+
     // a single pixel
-    // tft.drawPixel(tft.width() / 2, tft.height() / 2, ST77XX_GREEN);
+    tft.drawPixel(tft.width() / 2, tft.height() / 2, ST77XX_GREEN);
 }
 
 void drawCube()
@@ -138,20 +142,24 @@ void drawCube()
 
     ArduGL::renderPrimitives();
 
-    Serial.write("FRAME_SEP");
-    Serial.write(colorBuffer, colorBufferSize);
-    Serial.write(depthBuffer, depthBufferSize);
-    Serial.flush();
-
-    // TODO: picture is jagged
+    // this prevents screen blinking
+    tft.SPI_CS_HIGH();
 
     tft.startWrite();
     const int renderTargetX = (tft.width() - screenWidth) / 2;
     const int renderTargetY = (tft.height() - screenHeight) / 2;
-
     tft.setAddrWindow(renderTargetX, renderTargetY, screenWidth, screenHeight);
     tft.writePixels(reinterpret_cast<uint16_t *>(colorBuffer), screenWidth * screenHeight, true);
     tft.endWrite();
+
+    tft.SPI_CS_LOW();
+
+#if ENABLE_SERIAL_FRAME_DUMP
+    Serial.write("FRAME_SEP");
+    Serial.write(colorBuffer, colorBufferSize);
+    Serial.write(depthBuffer, depthBufferSize);
+    Serial.flush();
+#endif
 
     // TODO: upscale buffers on their way out? OR keep the buffers in flsah for increased storage ->
     // with reads/writes to flash, it's effectively mobile tile rendering
