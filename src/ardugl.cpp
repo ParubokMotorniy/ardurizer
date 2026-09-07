@@ -3,77 +3,58 @@
 //
 // Architecture overview
 // ─────────────────────
-// • Two full-resolution ping-pong color buffers live in SRAM.
-//   (Code-flash programming is disabled in the Arduino RA4M1 framework config;
-//    data flash is only 8 KB — too small for a 240×135×2 = 64 800-byte frame.)
-//
-// • Two small in-RAM tiles (color + depth) are the only working surfaces the
-//   rasterizer writes into.  After each tile is finished it is committed
-//   (memcpy'd) into the active ping-pong buffer at the correct offset.
+// • Two tiny ping-pong COLOR tiles live in SRAM (each TILE_W×TILE_H×2 bytes).
+//   One single DEPTH tile is shared (TILE_W×TILE_H×1 byte).
+//   At 16×16: 2×512 + 256 = 1280 bytes total.
 //
 // • Triangle binning: all triangles are transformed once per frame by
 //   binTriangles().  Each triangle is recorded in every tile whose AABB
 //   overlaps the triangle's screen-space AABB.
 //
-// • DMA path (ARDUGL_USE_HW_SPI_DMA == 1, requires DC rewired off pin 12):
-//   scheduleDisplayTransfer() arms DMAC channel 0 to stream the committed
-//   buffer to R_SPI0->SPDR, triggered by ELC_EVENT_SPI0_TXI.  The SPI0_TEI
-//   ISR deasserts CS and clears the busy flag.
+// • Per-tile loop (caller side):
+//     binTriangles();
+//     renderTile(0, 0);                          // prime
+//     for each subsequent tile (tx, ty):
+//         scheduleDisplayTransfer(prev_tx, prev_ty); // push committed, flip
+//         renderTile(tx, ty);                        // rasterize into active
+//     scheduleDisplayTransfer(last_tx, last_ty);     // push final tile
 //
-// • Soft-SPI fallback (ARDUGL_USE_HW_SPI_DMA == 0, current default):
-//   scheduleDisplayTransfer() is a no-op.  The caller uses
-//   getCommittedBuffer() + Adafruit writePixels() as before.
+// • Soft-SPI path (ARDUGL_USE_HW_SPI_DMA == 0, default):
+//   scheduleDisplayTransfer() calls tft.setAddrWindow() + tft.writePixels()
+//   synchronously for the committed tile, then flips active/committed.
+//
+// • DMA path (ARDUGL_USE_HW_SPI_DMA == 1, requires DC rewired off pin 12):
+//   scheduleDisplayTransfer() blocks until the previous tile's DMA finishes,
+//   then arms DMAC channel 0 for the committed tile asynchronously and flips.
+//   The CPU overlaps the next renderTile() with the ongoing DMA transfer.
 // =============================================================================
 
 #include "ardugl.h"
 
 #include "glm.hpp"
 
+#include <Adafruit_ST7789.h>
 #include <Arduino.h>
 
 #include <cassert>
 #include <cstdint>
 #include <cstring>
-#include <malloc.h>
 #include <vector>
 
-// FSP flash LP driver — code-flash programming enabled in r_flash_lp_cfg.h
-#include "r_flash_lp.h"
-// Note: hal_data.h declares g_flash0_ctrl / g_flash0_cfg as extern but never
-// defines them (no hal_data.c in the Arduino framework).  We define our own
-// flash instance here in blocking (non-BGO) mode — no IRQ needed.
-static flash_lp_instance_ctrl_t s_flash_ctrl;
-static const flash_cfg_t s_flash_cfg =
-{
-    .data_flash_bgo      = false,   // blocking mode — no background operation
-    .p_callback          = nullptr,
-    .p_extend            = nullptr,
-    .p_context           = nullptr,
-    .ipl                 = (BSP_IRQ_DISABLED),
-    .irq                 = FSP_INVALID_VECTOR,
-    .err_ipl             = (BSP_IRQ_DISABLED),
-    .err_irq             = FSP_INVALID_VECTOR,
-};
-
 #if ARDUGL_USE_HW_SPI_DMA
-#include "R7FA4M1AB.h"
+// r_dmac.h pulls in bsp_api.h → renesas.h → R7FA4M1AB.h transitively.
 #include "r_dmac.h"
-#include "bsp_elc.h"
-#include "vector_data.h"
+// bsp_elc.h is not on the standard include path — use the path relative to
+// the framework variant prefix (matched by -iwithprefixbefore in includes.txt).
+#include "../../src/bsp/mcu/ra4m1/bsp_elc.h"
 #endif
 
-// undef Arduino helpers - got my own (well, glm's)
 #undef abs
 #undef radians
 
-// =============================================================================
-// Internal helpers
-// =============================================================================
-
-static void printTriangleInfo(const glm::vec3 &) {}
-
-extern char __HeapBase;
-extern char __StackTop;
+// Bring ArduGL types into file scope so internal static functions can use
+// ReturnInfo, EC_OK etc. without qualifying every occurrence.
+using namespace ArduGL;
 
 // =============================================================================
 // Data structures
@@ -82,101 +63,82 @@ extern char __StackTop;
 struct Buffer
 {
     char *buffPtr = nullptr;
-    int   buffSize = 0;
-    int   itemSize = 0;
+    int buffSize = 0;
+    int itemSize = 0;
 };
 
 struct AABB
 {
     // origin: bottom-left, Y-up (OpenGL convention)
-    float blX    = 0;
-    float blY    = 0;
-    float width  = 0;
+    float blX = 0;
+    float blY = 0;
+    float width = 0;
     float height = 0;
 };
 
 // Transformed triangle cached for the duration of one frame (binTriangles).
+// attrs[][]: fixed-size flat array — avoids heap allocation per triangle.
+// numAttrs: actual number of attributes returned by the vertex shader.
 struct CachedTriangle
 {
-    glm::vec4 sv[3];                    // screen-space positions after mapToScreen()
-    std::vector<float> attrs[3];        // per-vertex shader attributes
-    bool valid = false;                 // false = culled / off-screen
+    glm::vec4 sv[3];                       // screen-space positions
+    float attrs[3][ARDUGL_MAX_ATTRS] = {}; // per-vertex attributes
+    int numAttrs = 0;
+    bool valid = false;
 };
 
 // =============================================================================
 // Module-level state
 // =============================================================================
 
-// --- Legacy full-buffer bindings (used by renderPrimitives / testpipeline) ---
-Buffer vertexBuffer;
-Buffer indexBuffer;
-Buffer colorBuffer;   // legacy: points to caller-managed full-res buffer
-Buffer depthBuffer;   // legacy: points to caller-managed full-res buffer
+static Buffer vertexBuffer;
 
-AABB renderTargetDimensions;
+static AABB renderTargetDimensions; // kept for mapToScreen(); mirrors renderW/renderH
 
-// --- In-RAM tiles (allocated once, reused every tile) ---
-// Color tile: ARDUGL_TILE_W * ARDUGL_TILE_H * sizeof(uint16_t)
-// Depth tile: ARDUGL_TILE_W * ARDUGL_TILE_H * sizeof(uint8_t)
-static uint16_t colorTile[ARDUGL_TILE_W * ARDUGL_TILE_H];
-static uint8_t  depthTile[ARDUGL_TILE_W * ARDUGL_TILE_H];
+// --- In-RAM ping-pong color tiles + single depth tile ---
+// pingPongTile[0] and [1] alternate: one is being rasterized into while
+// the other is being (or has just been) sent to the display.
+// depthTile is shared — it is cleared at the start of every renderTile().
+static uint16_t pingPongTile[2][ARDUGL_TILE_W * ARDUGL_TILE_H];
+static uint8_t depthTile[ARDUGL_TILE_W * ARDUGL_TILE_H];
 
 // Clear color applied at the start of every renderTile() call.
 // Stored pre-packed as RGB565 to avoid re-packing per tile.
 static uint16_t clearColorPacked = 0x18C6; // packRGB565({0.2, 0.2, 0.2})
 
-// --- Flash ping-pong frame buffers ---
-// Linker symbols defined in fsp.ld — these are the physical flash addresses.
-extern uint16_t __ardugl_fb0_start[];
-extern uint16_t __ardugl_fb1_start[];
+// Ping-pong indices.
+// activeTileIdx    — the tile currently being rasterized into.
+// committedTileIdx — the tile last finished, ready for display.
+static int activeTileIdx = 0;
+static int committedTileIdx = 1;
 
-// Pointers to the two flash frame buffers (set by initFlashBuffers).
-static uint16_t *flashFrameBuf[2] = { nullptr, nullptr };
-static int       flashFrameRenderW  = 0;  // pixels per row
-static int       flashFrameRenderH  = 0;  // rows per frame
-static size_t    flashFrameSize     = 0;  // bytes per frame
-static int       activeBufIdx       = 0;  // being rasterized into
-static int       committedBufIdx    = 1;  // last fully committed (display-ready)
-
-// CF erase block size = 2 KB (from BSP_FEATURE_FLASH_LP_CF_BLOCK_SIZE)
-constexpr uint32_t CF_BLOCK_SIZE  = 0x800U;
-// CF write granularity = 8 bytes (from BSP_FEATURE_FLASH_LP_CF_WRITE_SIZE)
-constexpr uint32_t CF_WRITE_SIZE  = 8U;
-
-// Per-frame erase tracker: one bit per 2 KB CF block.
-// 256 KB / 2 KB = 128 blocks → 128 bits = 16 bytes.
-// Reset at the start of each frame by binTriangles().
-static uint8_t eraseBlockDone[16] = {};
-
-static inline bool isBlockErased(uint32_t blockIdx)
-{
-    return (eraseBlockDone[blockIdx >> 3] >> (blockIdx & 7)) & 1u;
-}
-static inline void markBlockErased(uint32_t blockIdx)
-{
-    eraseBlockDone[blockIdx >> 3] |= static_cast<uint8_t>(1u << (blockIdx & 7));
-}
+// Render-target dimensions (set by setRenderTargetDimensions).
+static int renderW = 0;
+static int renderH = 0;
 
 // --- Triangle bin ---
 // For each tile: a list of triangle indices (into cachedTriangles[]) that
 // overlap that tile.  Stored as a flat 2-D array.
-static uint16_t  tileBins[ARDUGL_MAX_TILES][ARDUGL_MAX_TRIS_PER_TILE];
-static uint8_t   tileBinCount[ARDUGL_MAX_TILES]; // number of entries per tile
+static uint16_t tileBins[ARDUGL_MAX_TILES][ARDUGL_MAX_TRIS_PER_TILE];
+static uint8_t tileBinCount[ARDUGL_MAX_TILES]; // number of entries per tile
 
 // Cached per-frame triangle data produced by binTriangles().
 static CachedTriangle cachedTriangles[ARDUGL_MAX_TRIANGLES];
-static int            cachedTriangleCount = 0;
+
+// --- Display handle (soft-SPI path) ---
+// Set by initTiledPipeline(); used by scheduleDisplayTransfer().
+static Adafruit_ST7789 *s_tft = nullptr;
 
 // --- DMA state ---
 static volatile bool dmaTransferBusy = false;
 
 #if ARDUGL_USE_HW_SPI_DMA
-static dmac_instance_ctrl_t  dmacCtrl;
-static transfer_info_t       dmacInfo;
-static dmac_extended_cfg_t   dmacExtCfg;
-static transfer_cfg_t        dmacCfg;
-static uint8_t               dmaCsPin  = 10;
-static uint8_t               dmaDcPin  = 9;
+static dmac_instance_ctrl_t dmacCtrl;
+static transfer_info_t dmacInfo;
+static dmac_extended_cfg_t dmacExtCfg;
+static transfer_cfg_t dmacCfg;
+static uint8_t dmaCsPin = 10;
+static uint8_t dmaDcPin = 9;
 
 extern "C" void ardugl_spi_tei_isr();
 #endif
@@ -187,8 +149,10 @@ extern "C" void ardugl_spi_tei_isr();
 
 static uint16_t quantizeChannel(float value, uint16_t maxValue)
 {
-    if (!(value >= 0.0f)) return 0;
-    if (value > 1.0f)     value = 1.0f;
+    if (!(value >= 0.0f))
+        return 0;
+    if (value > 1.0f)
+        value = 1.0f;
     return static_cast<uint16_t>(value * static_cast<float>(maxValue) + 0.5f);
 }
 
@@ -202,167 +166,89 @@ static uint16_t packRGB565(const glm::vec3 &color)
 
 static uint8_t packDepthIntoByte(float depth)
 {
-    if (depth < 0.0f) depth = 0.0f;
-    if (depth > 1.0f) depth = 1.0f;
+    if (depth < 0.0f)
+        depth = 0.0f;
+    if (depth > 1.0f)
+        depth = 1.0f;
     return static_cast<uint8_t>(depth * 255.0f);
 }
 
 // =============================================================================
-// Buffer management
+// Buffer / pipeline setup
 // =============================================================================
-
-// --- Tile clear ---
-
-ArduGL::ReturnInfo ArduGL::clearTile(BufferType buffType, float clearValue)
-{
-    switch (buffType)
-    {
-    case BufferType::BT_Depth:
-    {
-        const uint8_t v = packDepthIntoByte(clearValue);
-        memset(depthTile, v, sizeof(depthTile));
-        break;
-    }
-    case BufferType::BT_Color:
-    {
-        const uint16_t v = packRGB565(glm::vec3(clearValue));
-        for (int i = 0; i < ARDUGL_TILE_W * ARDUGL_TILE_H; ++i)
-            colorTile[i] = v;
-        break;
-    }
-    default:
-        return ReturnInfo{ false, EC_InvalidOperation };
-    }
-    return ReturnInfo{ true, EC_OK };
-}
 
 void ArduGL::setClearColor(float r, float g, float b)
 {
     clearColorPacked = packRGB565(glm::vec3(r, g, b));
 }
 
-// --- Legacy full-buffer clear (used by testpipeline / renderPrimitives) ---
-
-ArduGL::ReturnInfo ArduGL::clearBuffer(BufferType buffType, float clearValue)
+ArduGL::ReturnInfo ArduGL::bindVertexBuffer(char *buffPtr, int buffSize, int itemSize)
 {
-    switch (buffType)
-    {
-    case BufferType::BT_VertexAttribute:
-    case BufferType::BT_VertexIndex:
-        return ReturnInfo{ false, EC_InvalidOperation };
-    case BufferType::BT_Depth:
-    {
-        if (!depthBuffer.buffPtr) return ReturnInfo{ false, EC_InvalidOperation };
-        const int   count = depthBuffer.buffSize / depthBuffer.itemSize;
-        const uint8_t v   = packDepthIntoByte(clearValue);
-        memset(depthBuffer.buffPtr, v, count * sizeof(uint8_t));
-        break;
-    }
-    case BufferType::BT_Color:
-    {
-        if (!colorBuffer.buffPtr) return ReturnInfo{ false, EC_InvalidOperation };
-        uint16_t      *p     = reinterpret_cast<uint16_t *>(colorBuffer.buffPtr);
-        const int      count = colorBuffer.buffSize / colorBuffer.itemSize;
-        const uint16_t v     = packRGB565(glm::vec3(clearValue));
-        for (int i = 0; i < count; ++i) p[i] = v;
-        break;
-    }
-    default:
-        return ReturnInfo{ false, EC_UnsupportedBufferType };
-    }
-    return ReturnInfo{ true, EC_OK };
-}
-
-ArduGL::ReturnInfo ArduGL::bindBuffer(BufferType buffType, char *buffPtr, int buffSize,
-                                      int itemSize)
-{
-    switch (buffType)
-    {
-    case BufferType::BT_VertexAttribute:
-        vertexBuffer = Buffer{ .buffPtr = buffPtr, .buffSize = buffSize, .itemSize = itemSize };
-        break;
-    case BufferType::BT_VertexIndex:
-        indexBuffer = Buffer{ .buffPtr = buffPtr, .buffSize = buffSize, .itemSize = itemSize };
-        break;
-    case BufferType::BT_Depth:
-        depthBuffer = Buffer{ .buffPtr = buffPtr, .buffSize = buffSize, .itemSize = itemSize };
-        break;
-    case BufferType::BT_Color:
-        colorBuffer = Buffer{ .buffPtr = buffPtr, .buffSize = buffSize, .itemSize = itemSize };
-        break;
-    default:
-        return ReturnInfo{ false, EC_UnsupportedBufferType };
-    }
-    return ReturnInfo{ true, EC_OK };
-}
-
-ArduGL::ReturnInfo ArduGL::unbindBuffer(BufferType buffType)
-{
-    switch (buffType)
-    {
-    case BufferType::BT_VertexAttribute:
-        vertexBuffer.buffPtr = nullptr;
-        break;
-    case BufferType::BT_VertexIndex:
-        indexBuffer.buffPtr = nullptr;
-        break;
-    case BufferType::BT_Depth:
-        depthBuffer.buffPtr = nullptr;
-        break;
-    case BufferType::BT_Color:
-        colorBuffer.buffPtr = nullptr;
-        break;
-    default:
-        return ReturnInfo{ false, EC_UnsupportedBufferType };
-    }
+    vertexBuffer = Buffer{ .buffPtr = buffPtr, .buffSize = buffSize, .itemSize = itemSize };
     return ReturnInfo{ true, EC_OK };
 }
 
 ArduGL::ReturnInfo ArduGL::setRenderTargetDimensions(int width, int height)
 {
-    renderTargetDimensions = AABB{ .blX    = 0.0f,
-                                   .blY    = 0.0f,
-                                   .width  = static_cast<float>(width),
+    renderTargetDimensions = AABB{ .blX = 0.0f,
+                                   .blY = 0.0f,
+                                   .width = static_cast<float>(width),
                                    .height = static_cast<float>(height) };
+    renderW = width;
+    renderH = height;
     return ReturnInfo{ true, EC_OK };
 }
 
-ArduGL::ReturnInfo ArduGL::initFlashBuffers(int renderW, int renderH)
+void ArduGL::initTiledPipeline(Adafruit_ST7789 *tft, uint8_t csPin, uint8_t dcPin)
 {
-    assert(renderW > 0 && renderH > 0);
-    // Write size alignment: each row must be a multiple of CF_WRITE_SIZE bytes.
-    // CF_WRITE_SIZE = 8 bytes = 4 pixels (uint16_t). Enforce at API boundary.
-    assert((renderW % 4) == 0 && "renderW must be a multiple of 4 for CF write alignment");
+    s_tft = tft;
+    activeTileIdx = 0;
+    committedTileIdx = 1;
 
-    flashFrameBuf[0]   = __ardugl_fb0_start;
-    flashFrameBuf[1]   = __ardugl_fb1_start;
-    flashFrameRenderW  = renderW;
-    flashFrameRenderH  = renderH;
-    flashFrameSize     = static_cast<size_t>(renderW) * renderH * sizeof(uint16_t);
-    activeBufIdx       = 0;
-    committedBufIdx    = 1;
+#if ARDUGL_USE_HW_SPI_DMA
+    dmaCsPin = csPin;
+    dmaDcPin = dcPin;
 
-    // Open the FSP flash driver (safe to call even if already open —
-    // R_FLASH_LP_Open returns FSP_ERR_ALREADY_OPEN in that case, which we ignore).
-    R_FLASH_LP_Open(&s_flash_ctrl, &s_flash_cfg);
+    // Install TEI ISR once — fires when the last SPI byte leaves the shift
+    // register, deasserts CS and clears dmaTransferBusy.
+    constexpr IRQn_Type kTeiIrq = static_cast<IRQn_Type>(8);
+    R_ICU->IELSR[kTeiIrq] = ELC_EVENT_SPI0_TEI;
+    NVIC_SetVector(kTeiIrq, reinterpret_cast<uint32_t>(ardugl_spi_tei_isr));
+    NVIC_SetPriority(kTeiIrq, 12);
+    NVIC_EnableIRQ(kTeiIrq);
 
-    return ReturnInfo{ true, EC_OK };
+    // Open DMAC channel 0 once — only dmacInfo.p_src / .length change per tile.
+    dmacInfo.transfer_settings_word_b.mode = TRANSFER_MODE_NORMAL;
+    dmacInfo.transfer_settings_word_b.size = TRANSFER_SIZE_2_BYTE;
+    dmacInfo.transfer_settings_word_b.src_addr_mode = TRANSFER_ADDR_MODE_INCREMENTED;
+    dmacInfo.transfer_settings_word_b.dest_addr_mode = TRANSFER_ADDR_MODE_FIXED;
+    dmacInfo.transfer_settings_word_b.irq = TRANSFER_IRQ_END;
+    dmacInfo.p_dest = reinterpret_cast<void *>(
+        const_cast<uint16_t *>(reinterpret_cast<volatile uint16_t *>(&R_SPI0->SPDR)));
+    dmacInfo.p_src = nullptr; // set per tile
+    dmacInfo.length = 0;      // set per tile
+    dmacInfo.num_blocks = 0;
+
+    dmacExtCfg.channel = 0;
+    dmacExtCfg.irq = FSP_INVALID_VECTOR;
+    dmacExtCfg.ipl = 0;
+    dmacExtCfg.activation_source = ELC_EVENT_SPI0_TXI;
+    dmacExtCfg.p_callback = nullptr;
+    dmacExtCfg.p_context = nullptr;
+
+    dmacCfg.p_info = &dmacInfo;
+    dmacCfg.p_extend = &dmacExtCfg;
+
+    R_DMAC_Open(&dmacCtrl, &dmacCfg);
+#else
+    (void)csPin;
+    (void)dcPin;
+#endif
 }
 
-int ArduGL::getTilesX()
-{
-    return (flashFrameRenderW + ARDUGL_TILE_W - 1) / ARDUGL_TILE_W;
-}
+static int getTilesX() { return (renderW + ARDUGL_TILE_W - 1) / ARDUGL_TILE_W; }
 
-int ArduGL::getTilesY()
-{
-    return (flashFrameRenderH + ARDUGL_TILE_H - 1) / ARDUGL_TILE_H;
-}
-
-const uint16_t *ArduGL::getCommittedBuffer()
-{
-    return flashFrameBuf[committedBufIdx];
-}
+static int getTilesY() { return (renderH + ARDUGL_TILE_H - 1) / ARDUGL_TILE_H; }
 
 // =============================================================================
 // Shader management
@@ -410,7 +296,7 @@ ArduGL::ReturnInfo ArduGL::unbindShader(ShaderType shType)
 }
 
 // =============================================================================
-// Pipeline geometry helpers (shared by legacy and tiled paths)
+// Pipeline geometry helpers
 // =============================================================================
 
 static void perspectiveDivide(glm::vec4 &clipPos)
@@ -440,8 +326,8 @@ static AABB computeTriangleAABB(const glm::vec4 &v1, const glm::vec4 &v2, const 
 
 static bool checkAABBIntersect(const AABB &b1, const AABB &b2)
 {
-    return !((b1.blX + b1.width)  < b2.blX || (b2.blX + b2.width)  < b1.blX
-          || (b1.blY + b1.height) < b2.blY || (b2.blY + b2.height) < b1.blY);
+    return !((b1.blX + b1.width) < b2.blX || (b2.blX + b2.width) < b1.blX
+             || (b1.blY + b1.height) < b2.blY || (b2.blY + b2.height) < b1.blY);
 }
 
 static glm::vec3 computeTriCrossProduct(const glm::vec4 &v1, const glm::vec4 &v2,
@@ -451,76 +337,17 @@ static glm::vec3 computeTriCrossProduct(const glm::vec4 &v1, const glm::vec4 &v2
                       glm::vec3(v3.x - v1.x, v3.y - v1.y, 0.0f));
 }
 
-// Rasterize triangle into coveredFragments, clamped to [xClampMin,xClampMax) x [yClampMin,yClampMax).
-// All coordinates are in screen space (Y-up).
-static void rasterizeTriangle(const AABB &triAABB, const glm::vec4 &v1, const glm::vec4 &v2,
-                               const glm::vec4 &v3, std::vector<glm::vec2> &coveredFragments,
-                               int xClampMin, int xClampMax, int yClampMin, int yClampMax)
-{
-    const glm::vec3 v1Pos{ v1.x, v1.y, 0.0f };
-    const glm::vec3 v2Pos{ v2.x, v2.y, 0.0f };
-    const glm::vec3 v3Pos{ v3.x, v3.y, 0.0f };
-    coveredFragments.clear();
-
-    const int xMin = glm::max(static_cast<int>(glm::ceil(triAABB.blX)),              xClampMin);
-    const int xMax = glm::min(static_cast<int>(glm::ceil(triAABB.blX + triAABB.width)),  xClampMax);
-    const int yMin = glm::max(static_cast<int>(glm::ceil(triAABB.blY)),              yClampMin);
-    const int yMax = glm::min(static_cast<int>(glm::ceil(triAABB.blY + triAABB.height)), yClampMax);
-
-    if (xMin >= xMax || yMin >= yMax) return;
-
-    constexpr float epsilon = 1.0e-6f;
-
-    for (int x = xMin; x < xMax; ++x)
-    {
-        for (int y = yMin; y < yMax; ++y)
-        {
-            const glm::vec3 fp{ static_cast<float>(x) + 0.5f,
-                                static_cast<float>(y) + 0.5f, 0.0f };
-
-            const float ce1 = glm::cross(fp - v1Pos, v2Pos - v1Pos).z;
-            const float ce2 = glm::cross(fp - v2Pos, v3Pos - v2Pos).z;
-            const float ce3 = glm::cross(fp - v3Pos, v1Pos - v3Pos).z;
-
-            if (ce1 > epsilon && ce2 > epsilon && ce3 > epsilon)
-            {
-                coveredFragments.emplace_back(static_cast<float>(x), static_cast<float>(y));
-                continue;
-            }
-
-            // Top-left rule for edge pixels
-            if (ce1 < 0.0f || ce2 < 0.0f || ce3 < 0.0f) continue;
-
-            auto edgeIsLeftOrTop = [&](const glm::vec3 &a, const glm::vec3 &b,
-                                       const glm::vec3 &other) -> bool {
-                const bool isTop  = glm::abs(a.y - b.y) < epsilon
-                                    && a.y > other.y && b.y > other.y;
-                const bool isLeft = !isTop
-                                    && ((a.x < b.x && a.x < other.x)
-                                        || (b.x < a.x && b.x < other.x));
-                return isTop || isLeft;
-            };
-
-            const bool e1ok = (ce1 <= epsilon) ? edgeIsLeftOrTop(v1Pos, v2Pos, v3Pos) : true;
-            const bool e2ok = (ce2 <= epsilon) ? edgeIsLeftOrTop(v2Pos, v3Pos, v1Pos) : true;
-            const bool e3ok = (ce3 <= epsilon) ? edgeIsLeftOrTop(v3Pos, v1Pos, v2Pos) : true;
-
-            if (e1ok && e2ok && e3ok)
-                coveredFragments.emplace_back(static_cast<float>(x), static_cast<float>(y));
-        }
-    }
-}
-
 static glm::vec3 computeBarycentricCoordinates(const glm::vec2 &point, const glm::vec4 &v1,
                                                const glm::vec4 &v2, const glm::vec4 &v3)
 {
-    const glm::vec3 p  { point.x, point.y, 0.0f };
-    const glm::vec3 a  { v1.x,    v1.y,    0.0f };
-    const glm::vec3 b  { v2.x,    v2.y,    0.0f };
-    const glm::vec3 c  { v3.x,    v3.y,    0.0f };
+    const glm::vec3 p{ point.x, point.y, 0.0f };
+    const glm::vec3 a{ v1.x, v1.y, 0.0f };
+    const glm::vec3 b{ v2.x, v2.y, 0.0f };
+    const glm::vec3 c{ v3.x, v3.y, 0.0f };
 
     const float totalArea = glm::length(glm::cross(c - a, b - a));
-    if (totalArea < 1e-10f) return { 1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f };
+    if (totalArea < 1e-10f)
+        return { 1.0f / 3.0f, 1.0f / 3.0f, 1.0f / 3.0f };
 
     const float w1 = glm::length(glm::cross(p - b, p - c)) / totalArea;
     const float w2 = glm::length(glm::cross(p - a, p - c)) / totalArea;
@@ -533,43 +360,44 @@ static glm::vec3 computeBarycentricCoordinates(const glm::vec2 &point, const glm
 // fragX, fragY are in screen space (Y-up, absolute render-target coordinates).
 static void shadeFragment(int fragX, int fragY, int bufOffsetX, int bufOffsetY, int bufWidth,
                           const glm::vec4 &sv1, const glm::vec4 &sv2, const glm::vec4 &sv3,
-                          const std::vector<float> &attrs1, const std::vector<float> &attrs2,
-                          const std::vector<float> &attrs3,
-                          uint16_t *colorBuf, uint8_t *depthBuf)
+                          const float attrs1[], const float attrs2[], const float attrs3[],
+                          int numAttrs, uint16_t *colorBuf, uint8_t *depthBuf)
 {
-    const glm::vec2 fc{ static_cast<float>(fragX) + 0.5f,
-                        static_cast<float>(fragY) + 0.5f };
+    const glm::vec2 fc{ static_cast<float>(fragX) + 0.5f, static_cast<float>(fragY) + 0.5f };
     const glm::vec3 bary = computeBarycentricCoordinates(fc, sv1, sv2, sv3);
 
     const glm::vec3 oneOverWs{ 1.0f / sv1.w, 1.0f / sv2.w, 1.0f / sv3.w };
-    const float     oneOverW  = glm::dot(bary, oneOverWs);
+    const float oneOverW = glm::dot(bary, oneOverWs);
 
-    // Depth test (write into local tile buffer)
+    // Depth test
     const int localIdx = (fragY - bufOffsetY) * bufWidth + (fragX - bufOffsetX);
-
     const float depth = glm::dot(bary, glm::vec3(sv1.z, sv2.z, sv3.z));
     const float storedDepth = depthBuf[localIdx] / 255.0f;
-    if (depth >= storedDepth) return;
+    if (depth >= storedDepth)
+        return;
     depthBuf[localIdx] = packDepthIntoByte(depth);
 
-    // Attribute interpolation (perspective-correct)
-    const int numAttrs = static_cast<int>(attrs1.size());
-    std::vector<float> interp;
-    interp.reserve(numAttrs);
+    // Perspective-correct attribute interpolation into a stack-allocated buffer.
+    // No heap allocation — fixed size matches ARDUGL_MAX_ATTRS.
+    float interp[ARDUGL_MAX_ATTRS];
     for (int a = 0; a < numAttrs; ++a)
     {
-        interp.emplace_back(
-            glm::dot(bary, glm::vec3(attrs1[a], attrs2[a], attrs3[a]) * oneOverWs) / oneOverW);
+        interp[a] = glm::dot(bary, glm::vec3(attrs1[a], attrs2[a], attrs3[a]) * oneOverWs)
+                    / oneOverW;
     }
 
-    colorBuf[localIdx] = packRGB565(fragmentShaderPtr(interp));
+    // Pass as std::vector to keep the fragment shader signature unchanged.
+    // This is a single small heap allocation per shaded fragment; acceptable
+    // for now — can be eliminated later by changing the shader signature.
+    const std::vector<float> interpVec(interp, interp + numAttrs);
+    colorBuf[localIdx] = packRGB565(fragmentShaderPtr(interpVec));
 }
 
 // =============================================================================
 // Tiled pipeline — binTriangles
 // =============================================================================
 
-ArduGL::ReturnInfo ArduGL::binTriangles()
+static ArduGL::ReturnInfo binTriangles()
 {
     assert(vertexShaderPtr && "Vertex shader not bound");
     assert(vertexBuffer.buffPtr && "Vertex buffer not bound");
@@ -582,10 +410,7 @@ ArduGL::ReturnInfo ArduGL::binTriangles()
     const int totalTiles = tilesX * tilesY;
     assert(totalTiles <= ARDUGL_MAX_TILES && "Increase ARDUGL_MAX_TILES");
 
-    // Reset bins and per-frame flash erase tracker
-    memset(tileBinCount,  0, sizeof(uint8_t) * totalTiles);
-    memset(eraseBlockDone, 0, sizeof(eraseBlockDone));
-    cachedTriangleCount = 0;
+    memset(tileBinCount, 0, sizeof(uint8_t) * totalTiles);
 
     for (int t = 0; t < totalTriangles; ++t)
     {
@@ -603,11 +428,10 @@ ArduGL::ReturnInfo ArduGL::binTriangles()
         mapToScreen(tv2.first);
         mapToScreen(tv3.first);
 
-        // Back-face culling
+        // Back-face cull
         if (computeTriCrossProduct(tv1.first, tv2.first, tv3.first).z >= 0.0f)
         {
             cachedTriangles[t].valid = false;
-            ++cachedTriangleCount;
             continue;
         }
 
@@ -617,20 +441,23 @@ ArduGL::ReturnInfo ArduGL::binTriangles()
         if (!checkAABBIntersect(renderTargetDimensions, triAABB))
         {
             cachedTriangles[t].valid = false;
-            ++cachedTriangleCount;
             continue;
         }
 
         // Cache the transformed triangle
-        cachedTriangles[t].valid    = true;
-        cachedTriangles[t].sv[0]    = tv1.first;
-        cachedTriangles[t].sv[1]    = tv2.first;
-        cachedTriangles[t].sv[2]    = tv3.first;
-        cachedTriangles[t].attrs[0] = tv1.second;
-        cachedTriangles[t].attrs[1] = tv2.second;
-        cachedTriangles[t].attrs[2] = tv3.second;
-        ++cachedTriangleCount;
-
+        const int nAttrs = static_cast<int>(tv1.second.size());
+        assert(nAttrs <= ARDUGL_MAX_ATTRS && "Increase ARDUGL_MAX_ATTRS");
+        cachedTriangles[t].valid = true;
+        cachedTriangles[t].sv[0] = tv1.first;
+        cachedTriangles[t].sv[1] = tv2.first;
+        cachedTriangles[t].sv[2] = tv3.first;
+        cachedTriangles[t].numAttrs = nAttrs;
+        for (int a = 0; a < nAttrs; ++a)
+        {
+            cachedTriangles[t].attrs[0][a] = tv1.second[a];
+            cachedTriangles[t].attrs[1][a] = tv2.second[a];
+            cachedTriangles[t].attrs[2][a] = tv3.second[a];
+        }
         // Bin into overlapping tiles
         for (int ty = 0; ty < tilesY; ++ty)
         {
@@ -639,18 +466,18 @@ ArduGL::ReturnInfo ArduGL::binTriangles()
                 // Tile AABB in screen space (Y-up)
                 const float tileBlX = static_cast<float>(tx * ARDUGL_TILE_W);
                 const float tileBlY = static_cast<float>(ty * ARDUGL_TILE_H);
-                const AABB tileAABB{ .blX    = tileBlX,
-                                     .blY    = tileBlY,
-                                     .width  = static_cast<float>(ARDUGL_TILE_W),
+                const AABB tileAABB{ .blX = tileBlX,
+                                     .blY = tileBlY,
+                                     .width = static_cast<float>(ARDUGL_TILE_W),
                                      .height = static_cast<float>(ARDUGL_TILE_H) };
 
-                if (!checkAABBIntersect(triAABB, tileAABB)) continue;
+                if (!checkAABBIntersect(triAABB, tileAABB))
+                    continue;
 
                 const int tileIdx = ty * tilesX + tx;
                 if (tileBinCount[tileIdx] < ARDUGL_MAX_TRIS_PER_TILE)
                 {
-                    tileBins[tileIdx][tileBinCount[tileIdx]++] =
-                        static_cast<uint16_t>(t);
+                    tileBins[tileIdx][tileBinCount[tileIdx]++] = static_cast<uint16_t>(t);
                 }
             }
         }
@@ -663,12 +490,13 @@ ArduGL::ReturnInfo ArduGL::binTriangles()
 // Tiled pipeline — renderTile
 // =============================================================================
 
-ArduGL::ReturnInfo ArduGL::renderTile(int tileCol, int tileRow)
+static ArduGL::ReturnInfo renderTile(int tileCol, int tileRow)
 {
     assert(fragmentShaderPtr && "Fragment shader not bound");
 
-    // Clear in-RAM tiles with the user-supplied clear color
-    for (int i = 0; i < ARDUGL_TILE_W * ARDUGL_TILE_H; ++i) colorTile[i] = clearColorPacked;
+    // Clear the active ping-pong color tile and the shared depth tile
+    for (int i = 0; i < ARDUGL_TILE_W * ARDUGL_TILE_H; ++i)
+        pingPongTile[activeTileIdx][i] = clearColorPacked;
     memset(depthTile, 0xFF, sizeof(depthTile)); // 0xFF = max depth (far)
 
     const int tilesX = getTilesX();
@@ -684,114 +512,66 @@ ArduGL::ReturnInfo ArduGL::renderTile(int tileCol, int tileRow)
     const int tileEndY = glm::min(tileOriginY + ARDUGL_TILE_H,
                                   static_cast<int>(renderTargetDimensions.height));
 
-    std::vector<glm::vec2> coveredFragments;
-
     for (int b = 0; b < tileBinCount[tileIdx]; ++b)
     {
         const int t = tileBins[tileIdx][b];
         const CachedTriangle &tri = cachedTriangles[t];
-        if (!tri.valid) continue;
+        if (!tri.valid)
+            continue;
 
         const AABB triAABB = computeTriangleAABB(tri.sv[0], tri.sv[1], tri.sv[2]);
 
-        rasterizeTriangle(triAABB, tri.sv[0], tri.sv[1], tri.sv[2], coveredFragments,
-                          tileOriginX, tileEndX, tileOriginY, tileEndY);
+        const glm::vec3 v1Pos{ tri.sv[0].x, tri.sv[0].y, 0.0f };
+        const glm::vec3 v2Pos{ tri.sv[1].x, tri.sv[1].y, 0.0f };
+        const glm::vec3 v3Pos{ tri.sv[2].x, tri.sv[2].y, 0.0f };
 
-        for (const glm::vec2 &frag : coveredFragments)
+        const int xMin = glm::max(static_cast<int>(glm::ceil(triAABB.blX)), tileOriginX);
+        const int xMax = glm::min(static_cast<int>(glm::ceil(triAABB.blX + triAABB.width)),
+                                  tileEndX);
+        const int yMin = glm::max(static_cast<int>(glm::ceil(triAABB.blY)), tileOriginY);
+        const int yMax = glm::min(static_cast<int>(glm::ceil(triAABB.blY + triAABB.height)),
+                                  tileEndY);
+
+        if (xMin >= xMax || yMin >= yMax)
+            continue;
+
+        constexpr float kEps = 1.0e-6f;
+
+        for (int x = xMin; x < xMax; ++x)
         {
-            shadeFragment(static_cast<int>(frag.x), static_cast<int>(frag.y),
-                          tileOriginX, tileOriginY, ARDUGL_TILE_W,
-                          tri.sv[0], tri.sv[1], tri.sv[2],
-                          tri.attrs[0], tri.attrs[1], tri.attrs[2],
-                          colorTile, depthTile);
-        }
-    }
-
-    return ReturnInfo{ true, EC_OK };
-}
-
-// =============================================================================
-// Tiled pipeline — commitTile
-//
-// Writes the finished in-RAM color tile into the active flash frame buffer.
-//
-// Y-flip: the rasterizer uses Y-up (OpenGL convention, row 0 = bottom).
-// The display expects Y-down (row 0 = top).  The flip is applied here so
-// the committed flash buffer is display-ready.
-//
-// Flash write strategy:
-//   • Erase granularity : 2 KB (CF_BLOCK_SIZE)
-//   • Write granularity : 8 bytes (CF_WRITE_SIZE) = 4 pixels
-//   • We must erase a full 2 KB block before writing any byte in it.
-//   • To avoid erasing the same block twice when two tile rows land in the
-//     same 2 KB block, we track which blocks have already been erased this
-//     frame in a small bitmask (one bit per 2 KB block, 128 blocks max for
-//     256 KB flash → 16 bytes).
-//
-// The erase bitmask is reset at the start of each frame by binTriangles().
-// =============================================================================
-
-ArduGL::ReturnInfo ArduGL::commitTile(int tileCol, int tileRow)
-{
-    assert(flashFrameBuf[activeBufIdx] && "initFlashBuffers() not called");
-
-    const int renderW     = flashFrameRenderW;
-    const int renderH     = flashFrameRenderH;
-    const int tileOriginX = tileCol * ARDUGL_TILE_W;
-    const int tileOriginY = tileRow * ARDUGL_TILE_H;
-    const int tileEndX    = glm::min(tileOriginX + ARDUGL_TILE_W, renderW);
-    const int tileEndY    = glm::min(tileOriginY + ARDUGL_TILE_H, renderH);
-    const int rowPixels   = tileEndX - tileOriginX;
-
-    // Base address of the active flash frame buffer.
-    const uint32_t fbBase = reinterpret_cast<uint32_t>(flashFrameBuf[activeBufIdx]);
-
-    // Temporary 8-byte aligned write buffer (CF_WRITE_SIZE = 8 bytes = 4 pixels).
-    // A tile row is at most ARDUGL_TILE_W pixels = ARDUGL_TILE_W*2 bytes.
-    // We pad to the next multiple of CF_WRITE_SIZE.
-    constexpr int kMaxRowBytes = ((ARDUGL_TILE_W * 2 + CF_WRITE_SIZE - 1)
-                                  / CF_WRITE_SIZE) * CF_WRITE_SIZE;
-    uint8_t rowBuf[kMaxRowBytes];
-
-    for (int y = tileOriginY; y < tileEndY; ++y)
-    {
-        // Y-flip: screen row y (Y-up) → display row (renderH-1-y) (Y-down)
-        const int displayRow  = (renderH - 1 - y);
-        const uint32_t dstAddr = fbBase
-                                 + static_cast<uint32_t>(displayRow * renderW + tileOriginX)
-                                   * sizeof(uint16_t);
-
-        // Erase every 2 KB block that this row touches (first time only).
-        // A row write spans [dstAddr, dstAddr + rowPixels*2) bytes.
-        const uint32_t rowEndAddr = dstAddr + static_cast<uint32_t>(rowPixels) * 2;
-        for (uint32_t addr = dstAddr & ~(CF_BLOCK_SIZE - 1);
-             addr < rowEndAddr;
-             addr += CF_BLOCK_SIZE)
-        {
-            const uint32_t blockIdx = addr / CF_BLOCK_SIZE;
-            if (!isBlockErased(blockIdx))
+            for (int y = yMin; y < yMax; ++y)
             {
-                fsp_err_t err = R_FLASH_LP_Erase(&s_flash_ctrl, addr, 1);
-                if (err != FSP_SUCCESS) return ReturnInfo{ false, EC_FlashError };
-                markBlockErased(blockIdx);
+                const glm::vec3 fp{ x + 0.5f, y + 0.5f, 0.0f };
+                const float ce1 = glm::cross(fp - v1Pos, v2Pos - v1Pos).z;
+                const float ce2 = glm::cross(fp - v2Pos, v3Pos - v2Pos).z;
+                const float ce3 = glm::cross(fp - v3Pos, v1Pos - v3Pos).z;
+
+                if (ce1 < -kEps || ce2 < -kEps || ce3 < -kEps)
+                    continue;
+
+                // Top-left rule for on-edge pixels
+                if (ce1 <= kEps || ce2 <= kEps || ce3 <= kEps)
+                {
+                    auto isLeftOrTop = [&](const glm::vec3 &a, const glm::vec3 &b,
+                                           const glm::vec3 &o) -> bool {
+                        const bool top = glm::abs(a.y - b.y) < kEps && a.y > o.y && b.y > o.y;
+                        const bool left = !top
+                                          && ((a.x < b.x && a.x < o.x) || (b.x < a.x && b.x < o.x));
+                        return top || left;
+                    };
+                    if (ce1 <= kEps && !isLeftOrTop(v1Pos, v2Pos, v3Pos))
+                        continue;
+                    if (ce2 <= kEps && !isLeftOrTop(v2Pos, v3Pos, v1Pos))
+                        continue;
+                    if (ce3 <= kEps && !isLeftOrTop(v3Pos, v1Pos, v2Pos))
+                        continue;
+                }
+
+                shadeFragment(x, y, tileOriginX, tileOriginY, ARDUGL_TILE_W, tri.sv[0], tri.sv[1],
+                              tri.sv[2], tri.attrs[0], tri.attrs[1], tri.attrs[2], tri.numAttrs,
+                              pingPongTile[activeTileIdx], depthTile);
             }
         }
-
-        // Copy tile row into aligned write buffer, padding with 0xFF.
-        const int tileLocalY  = y - tileOriginY;
-        const int srcRowStart = tileLocalY * ARDUGL_TILE_W;
-        const int rowBytes    = rowPixels * static_cast<int>(sizeof(uint16_t));
-        memcpy(rowBuf, colorTile + srcRowStart, rowBytes);
-        if (rowBytes < kMaxRowBytes)
-            memset(rowBuf + rowBytes, 0xFF, kMaxRowBytes - rowBytes);
-
-        // Write to flash (must be multiple of CF_WRITE_SIZE bytes).
-        const int writeBytes = ((rowBytes + CF_WRITE_SIZE - 1) / CF_WRITE_SIZE) * CF_WRITE_SIZE;
-        fsp_err_t err = R_FLASH_LP_Write(&s_flash_ctrl,
-                                         reinterpret_cast<uint32_t>(rowBuf),
-                                         dstAddr,
-                                         static_cast<uint32_t>(writeBytes));
-        if (err != FSP_SUCCESS) return ReturnInfo{ false, EC_FlashError };
     }
 
     return ReturnInfo{ true, EC_OK };
@@ -799,202 +579,229 @@ ArduGL::ReturnInfo ArduGL::commitTile(int tileCol, int tileRow)
 
 // =============================================================================
 // Tiled pipeline — scheduleDisplayTransfer
+//
+// Pushes the committed (last finished) tile to the display, then flips
+// the ping-pong indices so the next renderTile() writes into the other tile.
+//
+// tileCol / tileRow identify the screen window for the committed tile.
+// They refer to the tile that was rendered in the PREVIOUS renderTile() call,
+// i.e. the caller's loop looks like:
+//
+//   renderTile(0, 0);                         // fill tile 0 into active
+//   for each subsequent tile (tx, ty):
+//       scheduleDisplayTransfer(prev_tx, prev_ty);  // push committed, flip
+//       renderTile(tx, ty);                         // fill next tile
+//   scheduleDisplayTransfer(last_tx, last_ty);      // push final tile
+//
+// With DMA enabled the push is asynchronous: the CPU starts renderTile() for
+// the next tile while the DMAC streams the committed tile over SPI.
 // =============================================================================
 
-bool ArduGL::isDisplayTransferBusy()
-{
-    return dmaTransferBusy;
-}
+bool ArduGL::isDisplayTransferBusy() { return dmaTransferBusy; }
 
 #if ARDUGL_USE_HW_SPI_DMA
 
 // SPI0 TEI ISR — fires when the last byte has left the shift register.
-// Deasserts CS, clears the busy flag, and flips the ping-pong index.
+// Deasserts CS and clears the busy flag.
 extern "C" void ardugl_spi_tei_isr()
 {
-    // Deassert CS (active-low)
     R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaCsPin, BSP_IO_LEVEL_HIGH);
-
-    // Disable SPI TX
     R_SPI0->SPCR &= ~(1u << 3); // clear SPE
-
-    // Flip ping-pong: the buffer we just sent is now the committed one
-    committedBufIdx = activeBufIdx;
-    activeBufIdx    = 1 - activeBufIdx;
-
     dmaTransferBusy = false;
 }
 
-ArduGL::ReturnInfo ArduGL::scheduleDisplayTransfer(uint8_t csPin, uint8_t dcPin)
+// ---------------------------------------------------------------------------
+// SPI helpers for the DMA path
+// ---------------------------------------------------------------------------
+
+// Wait for the SPI shift register to drain.
+static inline void spiWaitTxEmpty()
 {
-    if (dmaTransferBusy) return ReturnInfo{ false, EC_NotReady };
-
-    dmaCsPin = csPin;
-    dmaDcPin = dcPin;
-
-    const uint16_t *src    = pingPongBuf[activeBufIdx];
-    const uint32_t  nBytes = static_cast<uint32_t>(pingPongSize);
-    // DMAC normal mode: max 0xFFFF transfers per open.  For buffers larger
-    // than 65535 bytes a block-mode or chained approach is needed; at
-    // 60×33×2 = 3960 bytes we are well within the limit.
-    const uint16_t nTransfers = static_cast<uint16_t>(nBytes / 2); // 16-bit transfers
-
-    // Assert DC (data mode)
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dcPin, BSP_IO_LEVEL_HIGH);
-    // Assert CS
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)csPin, BSP_IO_LEVEL_LOW);
-
-    // Configure DMAC transfer info
-    dmacInfo.transfer_settings_word_b.mode          = TRANSFER_MODE_NORMAL;
-    dmacInfo.transfer_settings_word_b.size          = TRANSFER_SIZE_2_BYTE;
-    dmacInfo.transfer_settings_word_b.src_addr_mode = TRANSFER_ADDR_MODE_INCREMENTED;
-    dmacInfo.transfer_settings_word_b.dest_addr_mode= TRANSFER_ADDR_MODE_FIXED;
-    dmacInfo.transfer_settings_word_b.irq           = TRANSFER_IRQ_END;
-    dmacInfo.p_src   = src;
-    dmacInfo.p_dest  = &R_SPI0->SPDR;
-    dmacInfo.length  = nTransfers;
-    dmacInfo.num_blocks = 0;
-
-    dmacExtCfg.channel           = 0;
-    dmacExtCfg.irq               = FSP_INVALID_VECTOR;
-    dmacExtCfg.ipl               = 0;
-    dmacExtCfg.activation_source = ELC_EVENT_SPI0_TXI;
-    dmacExtCfg.p_callback        = nullptr;
-    dmacExtCfg.p_context         = nullptr;
-
-    dmacCfg.p_info   = &dmacInfo;
-    dmacCfg.p_extend = &dmacExtCfg;
-
-    // Install TEI ISR for CS deassert
-    // SPI0_TEI is not in the pre-built vector table for UNO R4 WiFi;
-    // we install it directly into the ICU software-configurable slot.
-    // IRQ slot 8 is unused in the framework vector_data.h.
-    constexpr IRQn_Type kTeiIrq = static_cast<IRQn_Type>(8);
-    R_ICU->IELSR[kTeiIrq] = ELC_EVENT_SPI0_TEI;
-    NVIC_SetVector(kTeiIrq, reinterpret_cast<uint32_t>(ardugl_spi_tei_isr));
-    NVIC_SetPriority(kTeiIrq, 12);
-    NVIC_EnableIRQ(kTeiIrq);
-
-    // Open (or reconfigure) DMAC
-    R_DMAC_Close(&dmacCtrl);
-    fsp_err_t err = R_DMAC_Open(&dmacCtrl, &dmacCfg);
-    if (err != FSP_SUCCESS)
+    while (!(R_SPI0->SPSR & (1u << 7)))
     {
-        R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)csPin, BSP_IO_LEVEL_HIGH);
-        return ReturnInfo{ false, EC_FlashError };
+    } // SPSR.IDLNF: wait until idle
+}
+
+// Send one byte synchronously over hardware SPI (DC already set by caller).
+static inline void spiWriteByte(uint8_t b)
+{
+    R_SPI0->SPCR |= (1u << 3); // SPE on
+    R_SPI0->SPDR = b;
+    spiWaitTxEmpty();
+    R_SPI0->SPCR &= ~(1u << 3); // SPE off
+}
+
+// Send one 16-bit word synchronously (used for CASET/RASET coordinate pairs).
+static inline void spiWriteWord(uint16_t w)
+{
+    spiWriteByte(static_cast<uint8_t>(w >> 8));
+    spiWriteByte(static_cast<uint8_t>(w & 0xFF));
+}
+
+// Send a ST7789 command byte (DC low) then switch DC high for data.
+static inline void spiCommand(uint8_t cmd)
+{
+    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaDcPin, BSP_IO_LEVEL_LOW);
+    spiWriteByte(cmd);
+    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaDcPin, BSP_IO_LEVEL_HIGH);
+}
+
+// Set the ST7789 address window synchronously.
+// x0,y0 — top-left corner in display coordinates (Y-down).
+// w, h   — width and height in pixels.
+static void spiSetAddrWindow(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h)
+{
+    // CASET — column address
+    spiCommand(0x2A);
+    spiWriteWord(x0);
+    spiWriteWord(static_cast<uint16_t>(x0 + w - 1));
+    // RASET — row address
+    spiCommand(0x2B);
+    spiWriteWord(y0);
+    spiWriteWord(static_cast<uint16_t>(y0 + h - 1));
+    // RAMWR — begin pixel data stream
+    spiCommand(0x2C);
+    // DC is now high (data); leave CS asserted for the DMA burst.
+}
+
+// ---------------------------------------------------------------------------
+
+static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
+{
+    // Block until the previous tile's DMA transfer completes.
+    while (dmaTransferBusy)
+    {
     }
-    R_DMAC_Enable(&dmacCtrl);
 
-    // Enable SPI TX (SPE + SPTIE)
-    R_SPI0->SPCR |= (1u << 3) | (1u << 7); // SPE | SPTIE
+    // Flip ping-pong: active (just rasterized) becomes committed (to display).
+    committedTileIdx = activeTileIdx;
+    activeTileIdx = 1 - activeTileIdx;
 
-    dmaTransferBusy = true;
+    const int tileOriginX = tileCol * ARDUGL_TILE_W;
+    const int tileOriginY = tileRow * ARDUGL_TILE_H;
+
+    // Clamp to render-target bounds (edge tiles may be smaller).
+    const int tileW = glm::min(ARDUGL_TILE_W, renderW - tileOriginX);
+    const int tileH = glm::min(ARDUGL_TILE_H, renderH - tileOriginY);
+
+    // Y-flip: rasterizer row 0 = bottom; display row 0 = top.
+    const int displayY = renderH - tileOriginY - tileH;
+
+    // Assert CS, send CASET/RASET/RAMWR synchronously, leave DC high for data.
+    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaCsPin, BSP_IO_LEVEL_LOW);
+    spiSetAddrWindow(static_cast<uint16_t>(tileOriginX), static_cast<uint16_t>(displayY),
+                     static_cast<uint16_t>(tileW), static_cast<uint16_t>(tileH));
+
+    // The committed tile rows are stored Y-up (row 0 = bottom of tile).
+    // DMA streams them in memory order, so we point it at the last row and
+    // send rows in reverse — each row is a separate DMA burst of tileW pixels.
+    // For full tiles (tileH == ARDUGL_TILE_H) this is always 16 bursts of 16.
+    for (int row = tileH - 1; row >= 0; --row)
+    {
+        const uint16_t *src = pingPongTile[committedTileIdx] + row * ARDUGL_TILE_W;
+
+        // Reconfigure source pointer and length for this row.
+        dmacInfo.p_src = src;
+        dmacInfo.length = static_cast<uint16_t>(tileW);
+        R_DMAC_Reconfigure(&dmacCtrl, &dmacInfo);
+        R_DMAC_Enable(&dmacCtrl);
+
+        // Trigger first transfer by enabling SPI TX interrupt.
+        dmaTransferBusy = true;
+        R_SPI0->SPCR |= (1u << 3) | (1u << 7); // SPE | SPTIE
+
+        // Wait for this row's DMA to finish before starting the next row.
+        // (True overlap only happens across tiles, not within a tile.)
+        while (dmaTransferBusy)
+        {
+        }
+    }
+
+    // CS is deasserted by the ISR after the last row; we are already done
+    // spinning above, so dmaTransferBusy is false and CS is high here.
     return ReturnInfo{ true, EC_OK };
 }
 
 #else // ARDUGL_USE_HW_SPI_DMA == 0
 
-ArduGL::ReturnInfo ArduGL::scheduleDisplayTransfer(uint8_t /*csPin*/, uint8_t /*dcPin*/)
+static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
 {
-    // Soft-SPI fallback: flip ping-pong immediately (no async transfer).
-    // The caller reads getCommittedBuffer() and pushes via Adafruit writePixels().
-    // The active buffer (just finished) becomes the committed (display-ready) one.
-    committedBufIdx = activeBufIdx;
-    activeBufIdx    = 1 - activeBufIdx;
+    s_tft->SPI_CS_HIGH();
+
+    assert(s_tft && "initTiledPipeline() not called");
+
+    // Flip ping-pong: active (just rasterized) becomes committed (to display).
+    committedTileIdx = activeTileIdx;
+    activeTileIdx = 1 - activeTileIdx;
+
+    const int tileOriginX = tileCol * ARDUGL_TILE_W;
+    const int tileOriginY = tileRow * ARDUGL_TILE_H;
+
+    // Clamp tile dimensions to render-target bounds.
+    const int tileW = glm::min(ARDUGL_TILE_W, renderW - tileOriginX);
+    const int tileH = glm::min(ARDUGL_TILE_H, renderH - tileOriginY);
+
+    // Y-flip: rasterizer row 0 = bottom; display row 0 = top.
+    // The tile occupies rasterizer rows [tileOriginY, tileOriginY+tileH).
+    // In display coordinates that maps to [(renderH - tileOriginY - tileH),
+    //                                      (renderH - tileOriginY - 1)].
+    const int displayY = renderH - tileOriginY - tileH;
+
+    // The committed tile's rows are stored Y-up (row 0 = bottom of tile).
+    // We need to send them Y-down, so we write rows in reverse order.
+    s_tft->startWrite();
+    s_tft->setAddrWindow(tileOriginX, displayY, tileW, tileH);
+    const uint16_t *tile = pingPongTile[committedTileIdx];
+    for (int row = tileH - 1; row >= 0; --row)
+    {
+        s_tft->writePixels(const_cast<uint16_t *>(tile + row * ARDUGL_TILE_W), tileW, true);
+    }
+    s_tft->endWrite();
+
+    s_tft->SPI_CS_LOW();
+
     return ReturnInfo{ true, EC_OK };
 }
 
 #endif // ARDUGL_USE_HW_SPI_DMA
 
 // =============================================================================
-// Legacy renderPrimitives — writes directly into the bound BT_Color / BT_Depth
-// buffers (no tiling).  Kept so testpipeline.cpp continues to work unchanged.
+// Public entry point — drawFrame
 // =============================================================================
 
-ArduGL::ReturnInfo ArduGL::renderPrimitives()
+ArduGL::ReturnInfo ArduGL::drawFrame()
 {
-    assert(vertexShaderPtr   && "Vertex shader not bound");
-    assert(fragmentShaderPtr && "Fragment shader not bound");
-    assert(colorBuffer.buffPtr && depthBuffer.buffPtr && "Color/depth buffers not bound");
+    ReturnInfo r = binTriangles();
+    if (!r.success)
+        return r;
 
-    std::vector<glm::vec2> coveredFragments;
-    const int renderW = static_cast<int>(renderTargetDimensions.width);
+    const int tilesX = getTilesX();
+    const int tilesY = getTilesY();
 
-    const int totalTriangles = vertexBuffer.buffSize / (3 * vertexBuffer.itemSize);
+    // Prime the pipeline: rasterize the first tile before entering the loop
+    // so there is always a committed tile ready to push on every iteration.
+    renderTile(0, 0);
 
-    for (int t = 0; t < totalTriangles; ++t)
+    for (int ty = 0; ty < tilesY; ++ty)
     {
-        const char *base = vertexBuffer.buffPtr + t * 3 * vertexBuffer.itemSize;
-
-        VertexShaderOutput tv1 = vertexShaderPtr(base + vertexBuffer.itemSize * 0);
-        VertexShaderOutput tv2 = vertexShaderPtr(base + vertexBuffer.itemSize * 1);
-        VertexShaderOutput tv3 = vertexShaderPtr(base + vertexBuffer.itemSize * 2);
-
-        perspectiveDivide(tv1.first);
-        perspectiveDivide(tv2.first);
-        perspectiveDivide(tv3.first);
-
-        mapToScreen(tv1.first);
-        mapToScreen(tv2.first);
-        mapToScreen(tv3.first);
-
-        if (computeTriCrossProduct(tv1.first, tv2.first, tv3.first).z >= 0.0f) continue;
-
-        const AABB triAABB = computeTriangleAABB(tv1.first, tv2.first, tv3.first);
-        if (!checkAABBIntersect(renderTargetDimensions, triAABB)) continue;
-
-        rasterizeTriangle(triAABB, tv1.first, tv2.first, tv3.first, coveredFragments,
-                          0, renderW,
-                          0, static_cast<int>(renderTargetDimensions.height));
-
-        uint16_t *colorBuf = reinterpret_cast<uint16_t *>(colorBuffer.buffPtr);
-        uint8_t  *depthBuf = reinterpret_cast<uint8_t  *>(depthBuffer.buffPtr);
-
-        for (const glm::vec2 &frag : coveredFragments)
+        for (int tx = 0; tx < tilesX; ++tx)
         {
-            const int fx = static_cast<int>(frag.x);
-            const int fy = static_cast<int>(frag.y);
-            const int idx = fy * renderW + fx;
+            if (tx == 0 && ty == 0)
+                continue;
 
-            const glm::vec2 fc{ static_cast<float>(fx) + 0.5f,
-                                static_cast<float>(fy) + 0.5f };
-            const glm::vec3 bary = computeBarycentricCoordinates(fc,
-                                       tv1.first, tv2.first, tv3.first);
-            const glm::vec3 oneOverWs{ 1.0f / tv1.first.w,
-                                       1.0f / tv2.first.w,
-                                       1.0f / tv3.first.w };
-            const float oneOverW = glm::dot(bary, oneOverWs);
+            // Push the previously rasterized (committed) tile to the display.
+            // On the DMA path this returns immediately and the transfer runs
+            // in the background while the CPU rasterizes the next tile.
+            const int prevTx = (tx > 0) ? tx - 1 : tilesX - 1;
+            const int prevTy = (tx > 0) ? ty : ty - 1;
+            r = scheduleDisplayTransfer(prevTx, prevTy);
+            if (!r.success)
+                return r;
 
-            // Depth test
-            const float depth       = glm::dot(bary, glm::vec3(tv1.first.z,
-                                                                tv2.first.z,
-                                                                tv3.first.z));
-            const float storedDepth = depthBuf[idx] / 255.0f;
-            if (depth >= storedDepth) continue;
-            depthBuf[idx] = packDepthIntoByte(depth);
-
-            // Attribute interpolation
-            const int numAttrs = static_cast<int>(tv1.second.size());
-            std::vector<float> interp;
-            interp.reserve(numAttrs);
-            for (int a = 0; a < numAttrs; ++a)
-            {
-                interp.emplace_back(
-                    glm::dot(bary,
-                             glm::vec3(tv1.second[a], tv2.second[a], tv3.second[a])
-                             * oneOverWs)
-                    / oneOverW);
-            }
-
-            colorBuf[idx] = packRGB565(fragmentShaderPtr(interp));
+            renderTile(tx, ty);
         }
     }
 
-    return ReturnInfo{ true, EC_OK };
-}
-
-ArduGL::ReturnInfo ArduGL::renderIndexedPrimitives()
-{
-    // Not yet implemented.
-    return ReturnInfo{ false, EC_InvalidOperation };
+    // Push the final tile.
+    return scheduleDisplayTransfer(tilesX - 1, tilesY - 1);
 }

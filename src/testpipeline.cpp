@@ -10,33 +10,13 @@
 #include <cstdint>
 #include <vector>
 
-// Set to 1 to use the new tile-based pipeline instead of the legacy path.
-// Requires bindPingPongBuffers() to be called in initializePipeline().
-#define ENABLE_TILED_PIPELINE    1
-
-#define ENABLE_SERIAL_FRAME_DUMP 0
-
 #undef radians
 
 namespace
 {
 
-constexpr int screenWidth = 240 / 4;
-constexpr int screenHeight = 135 / 4;
-
-// Legacy buffers — used by the non-tiled path (ENABLE_TILED_PIPELINE == 0)
-constexpr int depthBufferSize = screenWidth * screenHeight * sizeof(unsigned char);
-char *depthBuffer = new char[depthBufferSize];
-
-constexpr int colorBufferSize = screenWidth * screenHeight * sizeof(uint16_t);
-char *colorBuffer = new char[colorBufferSize];
-
-// Tiled path: full-resolution frame buffers live in code flash (see fsp.ld).
-// No SRAM allocation needed — initFlashBuffers() points directly at the
-// linker-reserved flash regions at 0x00020000 and 0x00030000.
-// Full-res dimensions for the tiled path:
-constexpr int fullScreenWidth  = 240;
-constexpr int fullScreenHeight = 135;
+constexpr int fullScreenWidth = 7 * 32;
+constexpr int fullScreenHeight = 4 * 32;
 
 struct Vertex
 {
@@ -61,8 +41,8 @@ Vertex *vertexBuffer = new Vertex[6 * 6]{
     Vertex{ {0.0, 2.0, 0.0}, {0.35, 1.00, 0.65} }, Vertex{ {2.0, 2.0, 0.0}, {0.52, 0.90, 0.80} }, Vertex{ {2.0, 0.0, 0.0}, {0.22, 0.72, 0.55} } // clang-format on
 };
 
-glm::mat4 proj = glm::perspective(glm::radians(45.0), (double)screenWidth / (double)screenHeight,
-                                  0.1, 1000.0);
+glm::mat4 proj = glm::perspective(glm::radians(45.0),
+                                  (double)fullScreenWidth / (double)fullScreenHeight, 0.1, 1000.0);
 glm::mat4 view = glm::translate(glm::mat4(1.0), glm::vec3(0.0, 0.0, -5.0));
 
 float runningParameter = 0.0;
@@ -81,7 +61,7 @@ glm::mat4 buildModelMatrix()
 
 glm::mat4 currentModelMatrix = buildModelMatrix();
 
-Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 12, /*MOSI*/ 11, /*SCK*/ 13);
+Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 9, -1);
 
 } // namespace
 
@@ -111,30 +91,11 @@ glm::vec3 cubeFragmentShader(const std::vector<float> &interpolatedAttributes)
 
 void initializePipeline()
 {
-    ArduGL::setRenderTargetDimensions(screenWidth, screenHeight);
-
-    // Vertex buffer is always needed
-    ArduGL::bindBuffer(ArduGL::BufferType::BT_VertexAttribute,
-                       reinterpret_cast<char *>(vertexBuffer), vertexBufferSize, sizeof(Vertex));
-
-    ArduGL::bindShader(ArduGL::ShaderType::ST_Vertex,
-                       reinterpret_cast<void *>(&cubeVertexShader));
+    ArduGL::bindVertexBuffer(reinterpret_cast<char *>(vertexBuffer), vertexBufferSize,
+                             sizeof(Vertex));
+    ArduGL::bindShader(ArduGL::ShaderType::ST_Vertex, reinterpret_cast<void *>(&cubeVertexShader));
     ArduGL::bindShader(ArduGL::ShaderType::ST_Fragment,
                        reinterpret_cast<void *>(&cubeFragmentShader));
-
-#if ENABLE_TILED_PIPELINE
-    // Tiled path: frame buffers live in code flash — no SRAM allocation.
-    // Use full display resolution (240×135). renderW must be a multiple of 4.
-    ArduGL::setRenderTargetDimensions(fullScreenWidth, fullScreenHeight);
-    ArduGL::initFlashBuffers(fullScreenWidth, fullScreenHeight);
-    ArduGL::setClearColor(0.05f, 0.05f, 0.1f); // dark navy background
-#else
-    // Legacy path: bind flat color + depth buffers.
-    ArduGL::bindBuffer(ArduGL::BufferType::BT_Depth, depthBuffer, depthBufferSize,
-                       sizeof(unsigned char));
-    ArduGL::bindBuffer(ArduGL::BufferType::BT_Color, colorBuffer, colorBufferSize,
-                       sizeof(uint16_t));
-#endif
 
     tft.init(135, 240);
     tft.setRotation(1);
@@ -146,11 +107,11 @@ void initializePipeline()
     delay(500);
     tft.fillScreen(ST77XX_BLACK);
 
-#if ENABLE_SERIAL_FRAME_DUMP
-    Serial.begin(115200, SERIAL_8N1);
-#endif
+    ArduGL::setRenderTargetDimensions(fullScreenWidth, fullScreenHeight);
+    ArduGL::setClearColor(0.05f, 0.7f, 0.5f);
+    ArduGL::initTiledPipeline(&tft, /*csPin=*/10, /*dcPin=*/9);
 
-    // a single pixel
+    // single pixel to confirm display is alive
     tft.drawPixel(tft.width() / 2, tft.height() / 2, ST77XX_GREEN);
 }
 
@@ -161,66 +122,5 @@ void drawCube()
     if (runningParameter > 1.0f)
         runningParameter -= 1.0f;
 
-#if ENABLE_TILED_PIPELINE
-    // -----------------------------------------------------------------------
-    // Tiled pipeline
-    // -----------------------------------------------------------------------
-    // Step 1: transform all triangles and bin them into tiles.
-    ArduGL::binTriangles();
-
-    // Step 2 + 3: for each tile, rasterize then commit into the active
-    // ping-pong buffer.
-    const int tilesX = ArduGL::getTilesX();
-    const int tilesY = ArduGL::getTilesY();
-    for (int ty = 0; ty < tilesY; ++ty)
-    {
-        for (int tx = 0; tx < tilesX; ++tx)
-        {
-            ArduGL::renderTile(tx, ty);
-            ArduGL::commitTile(tx, ty);
-        }
-    }
-
-    // Step 4 (soft-SPI fallback): flip ping-pong and push to display.
-    // scheduleDisplayTransfer() with ARDUGL_USE_HW_SPI_DMA == 0 just flips
-    // the index; we then push via Adafruit writePixels().
-    ArduGL::scheduleDisplayTransfer(/*csPin=*/10, /*dcPin=*/12);
-
-    const uint16_t *frame = ArduGL::getCommittedBuffer();
-
-    tft.SPI_CS_HIGH();
-    tft.startWrite();
-    // Tiled path renders at full display resolution — no centering offset needed.
-    tft.setAddrWindow(0, 0, fullScreenWidth, fullScreenHeight);
-    // The committed buffer already has Y flipped (display-ready) by commitTile().
-    tft.writePixels(const_cast<uint16_t *>(frame), fullScreenWidth * fullScreenHeight, true);
-    tft.endWrite();
-    tft.SPI_CS_LOW();
-
-#else
-    // -----------------------------------------------------------------------
-    // Legacy (non-tiled) pipeline
-    // -----------------------------------------------------------------------
-    ArduGL::clearBuffer(ArduGL::BufferType::BT_Depth, 1.0f);
-    ArduGL::clearBuffer(ArduGL::BufferType::BT_Color, 0.2f);
-
-    ArduGL::renderPrimitives();
-
-    tft.SPI_CS_HIGH();
-    tft.startWrite();
-    const int renderTargetX = (tft.width()  - screenWidth)  / 2;
-    const int renderTargetY = (tft.height() - screenHeight) / 2;
-    tft.setAddrWindow(renderTargetX, renderTargetY, screenWidth, screenHeight);
-    tft.writePixels(reinterpret_cast<uint16_t *>(colorBuffer), screenWidth * screenHeight, true);
-    tft.endWrite();
-    tft.SPI_CS_LOW();
-
-#if ENABLE_SERIAL_FRAME_DUMP
-    Serial.write("FRAME_SEP");
-    Serial.write(colorBuffer, colorBufferSize);
-    Serial.write(depthBuffer, depthBufferSize);
-    Serial.flush();
-#endif
-
-#endif // ENABLE_TILED_PIPELINE
+    ArduGL::drawFrame();
 }
