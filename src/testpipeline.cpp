@@ -8,7 +8,7 @@
 #include <cstdint>
 #include <vector>
 
-#if !ARDUGL_USE_HW_SPI_DMA
+#if !ARDUGL_USE_HW_SPI_ASYNC
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7789.h>
 #endif
@@ -64,8 +64,8 @@ glm::mat4 buildModelMatrix()
 
 glm::mat4 currentModelMatrix = buildModelMatrix();
 
-#if !ARDUGL_USE_HW_SPI_DMA
-Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 12, 11, 13);
+#if !ARDUGL_USE_HW_SPI_ASYNC
+Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 9, 11, 13);
 #endif
 
 } // namespace
@@ -105,7 +105,7 @@ void initializePipeline()
     ArduGL::setRenderTargetDimensions(fullScreenWidth, fullScreenHeight);
     ArduGL::setClearColor(0.05f, 0.7f, 0.5f);
 
-#if ARDUGL_USE_HW_SPI_DMA
+#if ARDUGL_USE_HW_SPI_ASYNC
     ArduGL::initTiledPipeline(/*csPin=*/10, /*dcPin=*/9);
     ArduGL::fillDisplay(0x07E0); // green
     delay(500);

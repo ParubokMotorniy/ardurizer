@@ -5,8 +5,8 @@
 // ─────────────────────
 // • Two tiny ping-pong COLOR tiles live in SRAM (each TILE_W×TILE_H×2 bytes).
 //   One single DEPTH tile is shared (TILE_W×TILE_H×1 byte).
-//   The DMA path adds one byte-packed RGB565 staging tile so the CPU can
-//   render the next tile while DMAC reads the previous one.
+//   The async path adds one 16-bit RGB565 staging tile so the CPU can
+//   render the next tile while the SPI ISR transmits the previous one.
 //
 // • Triangle binning: all triangles are transformed once per frame by
 //   binTriangles().  Each triangle is recorded in every tile whose AABB
@@ -20,14 +20,14 @@
 //         renderTile(tx, ty);                        // rasterize into active
 //     scheduleDisplayTransfer(last_tx, last_ty);     // push final tile
 //
-// • Soft-SPI path (ARDUGL_USE_HW_SPI_DMA == 0):
+// • Soft-SPI path (ARDUGL_USE_HW_SPI_ASYNC == 0):
 //   scheduleDisplayTransfer() calls tft.setAddrWindow() + tft.writePixels()
 //   synchronously for the committed tile, then flips active/committed.
 //
-// • DMA path (ARDUGL_USE_HW_SPI_DMA == 1): scheduleDisplayTransfer() blocks
-//   until the previous tile's DMA finishes, then arms DMAC channel 0 for the
-//   committed tile asynchronously and flips. The CPU overlaps the next
-//   renderTile() with the ongoing DMA transfer.
+// • Async SPI path (ARDUGL_USE_HW_SPI_ASYNC == 1): scheduleDisplayTransfer()
+//   blocks until the previous FSP transfer finishes, then starts the
+//   committed tile with R_SPI_Write() and flips. The CPU overlaps the next
+//   renderTile() with the ongoing interrupt-driven SPI transfer.
 // =============================================================================
 
 #include "ardugl.h"
@@ -36,25 +36,17 @@
 
 #include <Arduino.h>
 
-#if !ARDUGL_USE_HW_SPI_DMA
+#if !ARDUGL_USE_HW_SPI_ASYNC
 #include <Adafruit_ST7789.h>
 #else
-#include <SPI.h>
+#include "r_spi.h"
+#include "IRQManager.h"
 #endif
 
 #include <cassert>
 #include <cstdint>
 #include <cstring>
 #include <vector>
-
-#if ARDUGL_USE_HW_SPI_DMA
-// r_dmac.h pulls in bsp_api.h → renesas.h → R7FA4M1AB.h transitively.
-#include "r_dmac.h"
-#include "IRQManager.h"
-// bsp_elc.h is not on the standard include path — use the path relative to
-// the framework variant prefix (matched by -iwithprefixbefore in includes.txt).
-#include "../../src/bsp/mcu/ra4m1/bsp_elc.h"
-#endif
 
 #undef abs
 #undef radians
@@ -134,47 +126,38 @@ static CachedTriangle cachedTriangles[ARDUGL_MAX_TRIANGLES];
 
 // --- Display handle (soft-SPI path) ---
 // Set by initTiledPipeline(); used by scheduleDisplayTransfer().
-#if !ARDUGL_USE_HW_SPI_DMA
+#if !ARDUGL_USE_HW_SPI_ASYNC
 static Adafruit_ST7789 *s_tft = nullptr;
 #endif
 
-// --- DMA state ---
-static volatile bool dmaTransferBusy = false;
+// --- Asynchronous display state ---
+static volatile bool spiTransferBusy = false;
 
-#if ARDUGL_USE_HW_SPI_DMA
-// DMA consumes a compact, display-order tile. Keeping this separate from the
-// two rasterizer tiles lets the CPU render into the next tile while DMAC reads
-// this one.
-static uint8_t dmaPixelTile[ARDUGL_TILE_W * ARDUGL_TILE_H * 2];
-static dmac_instance_ctrl_t dmacCtrl;
-static transfer_info_t dmacInfo;
-static dmac_extended_cfg_t dmacExtCfg;
-static transfer_cfg_t dmacCfg;
-static bool dmaConfigured = false;
-static uint8_t dmaCsPin = 10;
-static uint8_t dmaDcPin = 9;
-static uint16_t dmaXOffset = 40;
-static uint16_t dmaYOffset = 52;
+#if ARDUGL_USE_HW_SPI_ASYNC
+// The staging tile is display-order RGB565 in the same byte order as the
+// working synchronous path. FSP's halfword SPI mode sends the high byte first
+// with MSB-first and byte swapping disabled. Keeping it separate from the
+// rasterizer tiles keeps the source buffer stable while R_SPI_Write() runs.
+static uint16_t spiPixelTile[ARDUGL_TILE_W * ARDUGL_TILE_H];
+static spi_instance_ctrl_t spiCtrl{};
+static spi_cfg_t spiCfg{};
+static spi_extended_cfg_t spiExtCfg{};
+static bool spiOpened = false;
+static volatile bool spiCsRaiseOnComplete = false;
+static volatile bool spiTransferFailed = false;
+#if ARDUGL_SPI_DEBUG
+static volatile uint32_t spiCompletedTransfers = 0;
+static volatile uint32_t spiErrorTransfers = 0;
+static uint32_t spiLastDebugReportMs = 0;
+#endif
+static uint8_t spiCsPin = 10;
+static uint8_t spiDcPin = 9;
+// Adafruit's 135x240 ST7789 initialization uses x=40 and y=52 for rotation 1.
+static uint16_t spiXOffset = 40;
+static uint16_t spiYOffset = 52;
 
-static void dmaCallback(dmac_callback_args_t *p_args);
+static void spiCallback(spi_callback_args_t *p_args);
 static void spiInitSt7789();
-
-static inline void spiConfigureDmaByteMode()
-{
-    // Adafruit's SPI transaction code may restore full-duplex mode after the
-    // pipeline is initialized. Reapply the exact byte-mode configuration
-    // before handing the peripheral to the DMAC.
-    R_SPI0->SPCR_b.SPE = 0;
-    R_SPI0->SPCR_b.SPTIE = 0;
-    R_SPI0->SPCR_b.SPRIE = 0;
-    R_SPI0->SPCR_b.MSTR = 1;
-    R_SPI0->SPCR_b.TXMD = 1;
-    R_SPI0->SPDCR = R_SPI0_SPDCR_SPBYT_Msk;
-    R_SPI0->SPCMD_b[0].SPB = 7;
-    (void)R_SPI0->SPSR;
-    R_SPI0->SPSR = 0;
-    R_SPI0->SPCR_b.SPE = 1;
-}
 #endif
 
 // =============================================================================
@@ -233,65 +216,95 @@ ArduGL::ReturnInfo ArduGL::setRenderTargetDimensions(int width, int height)
     return ReturnInfo{ true, EC_OK };
 }
 
-#if ARDUGL_USE_HW_SPI_DMA
-static void initDmaPipeline(uint8_t csPin, uint8_t dcPin)
+#if ARDUGL_USE_HW_SPI_ASYNC
+static void initAsyncSpiPipeline(uint8_t csPin, uint8_t dcPin)
 {
+    if (spiOpened)
+        return;
+
+#if ARDUGL_SPI_DEBUG
+    Serial.begin(115200);
+#endif
+
     activeTileIdx = 0;
     committedTileIdx = 1;
-    dmaCsPin = csPin;
-    dmaDcPin = dcPin;
+    spiCsPin = csPin;
+    spiDcPin = dcPin;
+    spiTransferBusy = false;
+    spiTransferFailed = false;
 
-    pinMode(dmaCsPin, OUTPUT);
-    pinMode(dmaDcPin, OUTPUT);
-    digitalWrite(dmaCsPin, HIGH);
-    digitalWrite(dmaDcPin, HIGH);
+    pinMode(spiCsPin, OUTPUT);
+    pinMode(spiDcPin, OUTPUT);
+    digitalWrite(spiCsPin, HIGH);
+    digitalWrite(spiDcPin, HIGH);
 
-    // Keep the Arduino SPI peripheral configuration (clock, mode and pins)
-    // while using its registers directly for the asynchronous pixel burst.
-    SPI.beginTransaction(SPISettings(32000000, MSBFIRST, SPI_MODE0));
-    spiConfigureDmaByteMode();
+    // The FSP SPI driver does not configure Arduino pin muxing. Configure the
+    // UNO R4's hardware SPI pins directly, then let R_SPI_Open own SPI0.
+    const fsp_err_t mosiPinErr
+        = R_IOPORT_PinCfg(&g_ioport_ctrl, digitalPinToBspPin(11),
+                          IOPORT_CFG_PERIPHERAL_PIN | IOPORT_PERIPHERAL_SPI);
+    assert(mosiPinErr == FSP_SUCCESS && "Unable to mux D11 as SPI MOSI");
+    // The ST7789 is write-only here, so no MISO pin is required. D12 remains
+    // available as an ordinary GPIO.
+    const fsp_err_t sckPinErr
+        = R_IOPORT_PinCfg(&g_ioport_ctrl, digitalPinToBspPin(13),
+                          IOPORT_CFG_PERIPHERAL_PIN | IOPORT_PERIPHERAL_SPI);
+    assert(sckPinErr == FSP_SUCCESS && "Unable to mux D13 as SPI clock");
+
+    spiCfg.channel = 0;
+    spiCfg.rxi_irq = FSP_INVALID_VECTOR;
+    spiCfg.txi_irq = FSP_INVALID_VECTOR;
+    spiCfg.tei_irq = FSP_INVALID_VECTOR;
+    spiCfg.eri_irq = FSP_INVALID_VECTOR;
+    spiCfg.rxi_ipl = 12;
+    spiCfg.txi_ipl = 12;
+    spiCfg.tei_ipl = 12;
+    spiCfg.eri_ipl = 12;
+    spiCfg.operating_mode = SPI_MODE_MASTER;
+    spiCfg.clk_phase = SPI_CLK_PHASE_EDGE_ODD;
+    spiCfg.clk_polarity = SPI_CLK_POLARITY_LOW;
+    spiCfg.mode_fault = SPI_MODE_FAULT_ERROR_DISABLE;
+    spiCfg.bit_order = SPI_BIT_ORDER_MSB_FIRST;
+    spiCfg.p_transfer_tx = nullptr;
+    spiCfg.p_transfer_rx = nullptr;
+    spiCfg.p_callback = spiCallback;
+    spiCfg.p_context = nullptr;
+    spiCfg.p_extend = &spiExtCfg;
+
+    spiExtCfg.spi_clksyn = SPI_SSL_MODE_CLK_SYN;
+    spiExtCfg.spi_comm = SPI_COMMUNICATION_TRANSMIT_ONLY;
+    spiExtCfg.ssl_polarity = SPI_SSLP_LOW;
+    spiExtCfg.ssl_select = SPI_SSL_SELECT_SSL0;
+    spiExtCfg.mosi_idle = SPI_MOSI_IDLE_VALUE_FIXING_DISABLE;
+    spiExtCfg.parity = SPI_PARITY_MODE_DISABLE;
+    spiExtCfg.byte_swap = SPI_BYTE_SWAP_DISABLE;
+    spiExtCfg.spck_delay = SPI_DELAY_COUNT_1;
+    spiExtCfg.ssl_negation_delay = SPI_DELAY_COUNT_1;
+    spiExtCfg.next_access_delay = SPI_DELAY_COUNT_1;
+    // FSP transmits one MSB-first RGB565 halfword per pixel.
+    const fsp_err_t bitrateErr = R_SPI_CalculateBitrate(ARDUGL_SPI_BITRATE,
+                                                        &spiExtCfg.spck_div);
+    assert(bitrateErr == FSP_SUCCESS && "Unable to calculate SPI bitrate");
+
+    // Arduino's SPI wrapper intentionally leaves these vectors invalid because
+    // it performs synchronous register transfers. The FSP driver needs the
+    // programmable IRQ slots so its TXI/RXI/TEI handlers can run.
+    SpiMasterIrqReq_t irqReq{ .ctrl = &spiCtrl, .cfg = &spiCfg, .hw_channel = 0 };
+    const bool irqConfigured = IRQManager::getInstance().addPeripheral(IRQ_SPI_MASTER, &irqReq);
+    assert(irqConfigured && "Unable to configure the SPI interrupt vectors");
+
+    const fsp_err_t openErr = R_SPI_Open(&spiCtrl, &spiCfg);
+    assert(openErr == FSP_SUCCESS && "Unable to open the FSP SPI channel");
+    spiOpened = (openErr == FSP_SUCCESS);
+
+    // Keep all controller commands synchronous. Only pixel payloads use the
+    // asynchronous R_SPI_Write() path below.
     spiInitSt7789();
-
-    // Open DMAC channel 0 once. The source pointer and length change for
-    // each tile; the activation source is the SPI0 transmit-empty event.
-    dmacInfo.transfer_settings_word_b.mode = TRANSFER_MODE_NORMAL;
-    dmacInfo.transfer_settings_word_b.size = TRANSFER_SIZE_1_BYTE;
-    dmacInfo.transfer_settings_word_b.src_addr_mode = TRANSFER_ADDR_MODE_INCREMENTED;
-    dmacInfo.transfer_settings_word_b.dest_addr_mode = TRANSFER_ADDR_MODE_FIXED;
-    dmacInfo.transfer_settings_word_b.irq = TRANSFER_IRQ_END;
-    dmacInfo.transfer_settings_word_b.repeat_area = TRANSFER_REPEAT_AREA_SOURCE;
-    dmacInfo.transfer_settings_word_b.chain_mode = TRANSFER_CHAIN_MODE_DISABLED;
-    dmacInfo.p_dest = reinterpret_cast<void *>(
-        const_cast<uint8_t *>(reinterpret_cast<volatile uint8_t *>(&R_SPI0->SPDR_BY)));
-    dmacInfo.p_src = dmaPixelTile;
-    dmacInfo.length = 1;
-    dmacInfo.num_blocks = 0;
-
-    dmacExtCfg.channel = 0;
-    dmacExtCfg.irq = FSP_INVALID_VECTOR;
-    dmacExtCfg.ipl = 12;
-    dmacExtCfg.offset = 0;
-    dmacExtCfg.src_buffer_size = 1;
-    dmacExtCfg.activation_source = ELC_EVENT_SPI0_TXI;
-    dmacExtCfg.p_callback = dmaCallback;
-    dmacExtCfg.p_context = nullptr;
-
-    dmacCfg.p_info = &dmacInfo;
-    dmacCfg.p_extend = &dmacExtCfg;
-
-    // Let the Arduino core allocate a programmable vector for the DMAC end
-    // interrupt. A hard-coded ICU slot can conflict with core peripherals.
-    const bool irqConfigured = IRQManager::getInstance().addDMA(dmacExtCfg);
-    assert(irqConfigured && "Unable to configure the DMAC interrupt");
-
-    const fsp_err_t err = R_DMAC_Open(&dmacCtrl, &dmacCfg);
-    assert(err == FSP_SUCCESS && "Unable to open the SPI DMA channel");
-    dmaConfigured = false;
 }
 
 void ArduGL::initTiledPipeline(uint8_t csPin, uint8_t dcPin)
 {
-    initDmaPipeline(csPin, dcPin);
+    initAsyncSpiPipeline(csPin, dcPin);
 }
 #else
 void ArduGL::initTiledPipeline(Adafruit_ST7789 *tft, uint8_t csPin, uint8_t dcPin)
@@ -651,64 +664,145 @@ static ArduGL::ReturnInfo renderTile(int tileCol, int tileRow)
 //       renderTile(tx, ty);                         // fill next tile
 //   scheduleDisplayTransfer(last_tx, last_ty);      // push final tile
 //
-// With DMA enabled the push is asynchronous: the CPU starts renderTile() for
-// the next tile while the DMAC streams the committed tile over SPI.
+// With async SPI enabled the push is asynchronous: the CPU starts renderTile()
+// for the next tile while the FSP SPI ISR streams the committed tile.
 // =============================================================================
 
-bool ArduGL::isDisplayTransferBusy() { return dmaTransferBusy; }
+bool ArduGL::isDisplayTransferBusy() { return spiTransferBusy; }
 
-#if ARDUGL_USE_HW_SPI_DMA
+#if ARDUGL_USE_HW_SPI_ASYNC
 
-// DMAC completion occurs when the final byte has been written to SPDR. Wait
-// for that byte to leave the shift register before releasing CS.
-static void dmaCallback(dmac_callback_args_t *p_args)
+// R_SPI_Write() completes from the SPI TEI interrupt after the final frame
+// leaves the shift register. Keep CS asserted until that callback arrives.
+static void spiCallback(spi_callback_args_t *p_args)
 {
-    (void)p_args;
-    R_SPI0->SPCR_b.SPTIE = 0;
-    while (R_SPI0->SPSR_b.IDLNF)
+    if (p_args == nullptr)
+        return;
+
+    if (p_args->event == SPI_EVENT_TRANSFER_COMPLETE)
+    {
+#if ARDUGL_SPI_DEBUG
+        ++spiCompletedTransfers;
+#endif
+        if (spiCsRaiseOnComplete)
+        {
+            // End the display transaction before changing D/C. The panel
+            // latches D/C only while CS is active, so this leaves the bus in
+            // a quiet command-state between tile transfers.
+            R_IOPORT_PinWrite(nullptr, digitalPinToBspPin(spiCsPin), BSP_IO_LEVEL_HIGH);
+            R_IOPORT_PinWrite(nullptr, digitalPinToBspPin(spiDcPin), BSP_IO_LEVEL_LOW);
+            spiCsRaiseOnComplete = false;
+        }
+        spiTransferBusy = false;
+        return;
+    }
+
+#if ARDUGL_SPI_DEBUG
+    ++spiErrorTransfers;
+#endif
+    spiTransferFailed = true;
+    if (spiCsRaiseOnComplete)
+    {
+        R_IOPORT_PinWrite(nullptr, digitalPinToBspPin(spiCsPin), BSP_IO_LEVEL_HIGH);
+        R_IOPORT_PinWrite(nullptr, digitalPinToBspPin(spiDcPin), BSP_IO_LEVEL_LOW);
+        spiCsRaiseOnComplete = false;
+    }
+    spiTransferBusy = false;
+}
+
+#if ARDUGL_SPI_DEBUG
+static void spiDebugReport()
+{
+    const uint32_t now = millis();
+    if (now - spiLastDebugReportMs < 1000)
+        return;
+    spiLastDebugReportMs = now;
+
+    noInterrupts();
+    const uint32_t completed = spiCompletedTransfers;
+    const uint32_t errors = spiErrorTransfers;
+    const bool busy = spiTransferBusy;
+    interrupts();
+
+    Serial.print("FSP SPI completed=");
+    Serial.print(completed);
+    Serial.print(" errors=");
+    Serial.print(errors);
+    Serial.print(" busy=");
+    Serial.println(busy ? 1 : 0);
+}
+#endif
+
+// ---------------------------------------------------------------------------
+// SPI helpers for the FSP interrupt-driven path
+// ---------------------------------------------------------------------------
+
+static inline void spiSetCs(bsp_io_level_t level)
+{
+    R_IOPORT_PinWrite(nullptr, digitalPinToBspPin(spiCsPin), level);
+}
+
+static inline void spiSetDc(bsp_io_level_t level)
+{
+    R_IOPORT_PinWrite(nullptr, digitalPinToBspPin(spiDcPin), level);
+}
+
+static bool spiWaitForIdle()
+{
+    while (spiTransferBusy)
     {
     }
 
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaCsPin, BSP_IO_LEVEL_HIGH);
-    dmaTransferBusy = false;
+    if (!spiTransferFailed)
+        return true;
+
+    spiTransferFailed = false;
+    spiSetCs(BSP_IO_LEVEL_HIGH);
+    spiSetDc(BSP_IO_LEVEL_LOW);
+    return false;
 }
 
-// ---------------------------------------------------------------------------
-// SPI helpers for the DMA path
-// ---------------------------------------------------------------------------
-
-// Wait for the SPI shift register to drain.
-static inline void spiWaitTxEmpty()
+// Synchronous wrapper used only during initialization and address setup.
+static bool spiWriteBlocking(const void *data, size_t length,
+                             spi_bit_width_t bitWidth = SPI_BIT_WIDTH_8_BITS)
 {
-    while (!R_SPI0->SPSR_b.SPTEF)
+    if (!spiWaitForIdle())
+        return false;
+
+    spiTransferFailed = false;
+    spiCsRaiseOnComplete = false;
+    spiTransferBusy = true;
+    const fsp_err_t err = R_SPI_Write(&spiCtrl, data, static_cast<uint32_t>(length), bitWidth);
+    if (err != FSP_SUCCESS)
+    {
+        spiTransferBusy = false;
+        spiTransferFailed = true;
+        return false;
+    }
+
+    while (spiTransferBusy)
     {
     }
+    return !spiTransferFailed;
 }
 
-// Send one byte synchronously over hardware SPI (DC already set by caller).
 static inline void spiWriteByte(uint8_t b)
 {
-    R_SPI0->SPCR_b.SPE = 1;
-    spiWaitTxEmpty();
-    R_SPI0->SPDR_BY = b;
-    while (R_SPI0->SPSR_b.IDLNF)
-    {
-    }
+    assert(spiWriteBlocking(&b, 1) && "Synchronous SPI write failed");
 }
 
-// Send one 16-bit word synchronously (used for CASET/RASET coordinate pairs).
 static inline void spiWriteWord(uint16_t w)
 {
-    spiWriteByte(static_cast<uint8_t>(w >> 8));
-    spiWriteByte(static_cast<uint8_t>(w & 0xFF));
+    const uint8_t bytes[] = { static_cast<uint8_t>(w >> 8), static_cast<uint8_t>(w) };
+    assert(spiWriteBlocking(bytes, sizeof(bytes)) && "Synchronous SPI write failed");
 }
 
 // Send a ST7789 command byte (DC low) then switch DC high for data.
 static inline void spiCommand(uint8_t cmd)
 {
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaDcPin, BSP_IO_LEVEL_LOW);
+    spiSetDc(BSP_IO_LEVEL_LOW);
     spiWriteByte(cmd);
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaDcPin, BSP_IO_LEVEL_HIGH);
+    spiSetDc(BSP_IO_LEVEL_HIGH);
 }
 
 // Set the ST7789 address window synchronously.
@@ -716,8 +810,8 @@ static inline void spiCommand(uint8_t cmd)
 // w, h   — width and height in pixels.
 static void spiSetAddrWindow(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h)
 {
-    x0 = static_cast<uint16_t>(x0 + dmaXOffset);
-    y0 = static_cast<uint16_t>(y0 + dmaYOffset);
+    x0 = static_cast<uint16_t>(x0 + spiXOffset);
+    y0 = static_cast<uint16_t>(y0 + spiYOffset);
 
     // CASET — column address
     spiCommand(0x2A);
@@ -729,25 +823,24 @@ static void spiSetAddrWindow(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h)
     spiWriteWord(static_cast<uint16_t>(y0 + h - 1));
     // RAMWR — begin pixel data stream
     spiCommand(0x2C);
-    // DC is now high (data); leave CS asserted for the DMA burst.
+    // DC is now high (data); leave CS asserted for the async pixel burst.
 }
 
 static void spiSendCommand(uint8_t command, const uint8_t *data = nullptr,
                             size_t dataLength = 0)
 {
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaCsPin, BSP_IO_LEVEL_LOW);
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaDcPin, BSP_IO_LEVEL_LOW);
+    spiSetCs(BSP_IO_LEVEL_LOW);
+    spiSetDc(BSP_IO_LEVEL_LOW);
     spiWriteByte(command);
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaDcPin, BSP_IO_LEVEL_HIGH);
+    spiSetDc(BSP_IO_LEVEL_HIGH);
     for (size_t i = 0; i < dataLength; ++i)
         spiWriteByte(data[i]);
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaCsPin, BSP_IO_LEVEL_HIGH);
+    spiSetCs(BSP_IO_LEVEL_HIGH);
 }
 
 static void spiInitSt7789()
 {
-    // This is the subset of Adafruit_ST7789's generic initialization needed
-    // by the 135x240 panel, expressed entirely through the raw SPI path.
+    // Match the generic ST7789 sequence used by the working synchronous path.
     spiSendCommand(0x01); // SWRESET
     delay(150);
     spiSendCommand(0x11); // SLPOUT
@@ -757,12 +850,12 @@ static void spiInitSt7789()
     spiSendCommand(0x3A, &colorMode, 1);
     delay(10);
 
-    const uint8_t rotation = 0xA0; // MY | MV | RGB, rotation 1
-    spiSendCommand(0x36, &rotation, 1);
+    const uint8_t genericMadctl = 0x08;
+    spiSendCommand(0x36, &genericMadctl, 1);
 
-    const uint8_t columnRange[] = { 0x00, 0x00, 0x00, 0xEF };
+    const uint8_t columnRange[] = { 0x00, 0x00, 0x00, 0xF0 };
     spiSendCommand(0x2A, columnRange, sizeof(columnRange));
-    const uint8_t rowRange[] = { 0x00, 0x00, 0x01, 0x3F };
+    const uint8_t rowRange[] = { 0x00, 0x00, 0x01, 0x40 };
     spiSendCommand(0x2B, rowRange, sizeof(rowRange));
 
     spiSendCommand(0x21); // INVON
@@ -771,36 +864,37 @@ static void spiInitSt7789()
     delay(10);
     spiSendCommand(0x29); // DISPON
     delay(10);
+
+    const uint8_t rotation = 0xA0; // MY | MV | RGB, rotation 1
+    spiSendCommand(0x36, &rotation, 1);
 }
 
 void ArduGL::fillDisplay(uint16_t color)
 {
-    while (dmaTransferBusy)
-    {
-    }
+    assert(spiWaitForIdle() && "Display transfer failed before fill");
 
-    spiConfigureDmaByteMode();
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaCsPin, BSP_IO_LEVEL_LOW);
+    for (uint16_t &pixel : spiPixelTile)
+        pixel = color;
+
+    spiSetCs(BSP_IO_LEVEL_LOW);
     spiSetAddrWindow(0, 0, 240, 135);
-    for (int i = 0; i < 240 * 135; ++i)
+    size_t remaining = static_cast<size_t>(240) * 135;
+    while (remaining != 0)
     {
-        spiWriteByte(static_cast<uint8_t>(color >> 8));
-        spiWriteByte(static_cast<uint8_t>(color));
+        const size_t count = glm::min(remaining, sizeof(spiPixelTile) / sizeof(spiPixelTile[0]));
+        assert(spiWriteBlocking(spiPixelTile, count, SPI_BIT_WIDTH_16_BITS)
+               && "Display fill SPI write failed");
+        remaining -= count;
     }
-    while (R_SPI0->SPSR_b.IDLNF)
-    {
-    }
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaCsPin, BSP_IO_LEVEL_HIGH);
+    spiSetCs(BSP_IO_LEVEL_HIGH);
+    spiSetDc(BSP_IO_LEVEL_LOW);
 }
 
 static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
 {
-    // Block until the previous tile's DMA transfer completes.
-    while (dmaTransferBusy)
-    {
-    }
-
-    spiConfigureDmaByteMode();
+    // Block until the previous tile's SPI transfer completes.
+    if (!spiWaitForIdle())
+        return ReturnInfo{ false, EC_InvalidOperation };
 
     // Flip ping-pong: active (just rasterized) becomes committed (to display).
     committedTileIdx = activeTileIdx;
@@ -817,12 +911,12 @@ static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
     const int displayY = renderH - tileOriginY - tileH;
 
     // Assert CS, send CASET/RASET/RAMWR synchronously, leave DC high for data.
-    R_IOPORT_PinWrite(nullptr, (bsp_io_port_pin_t)dmaCsPin, BSP_IO_LEVEL_LOW);
+    spiSetCs(BSP_IO_LEVEL_LOW);
     spiSetAddrWindow(static_cast<uint16_t>(tileOriginX), static_cast<uint16_t>(displayY),
                      static_cast<uint16_t>(tileW), static_cast<uint16_t>(tileH));
 
     // The committed tile is stored Y-up. Pack it into display order so the
-    // whole rectangular window is one contiguous DMA transfer, including
+    // whole rectangular window is one contiguous SPI transfer, including
     // non-full edge tiles.
     for (int outRow = 0; outRow < tileH; ++outRow)
     {
@@ -830,43 +924,32 @@ static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
         for (int x = 0; x < tileW; ++x)
         {
             const uint16_t pixel = pingPongTile[committedTileIdx][srcRow * ARDUGL_TILE_W + x];
-            const size_t out = static_cast<size_t>(outRow * tileW + x) * 2U;
-            dmaPixelTile[out] = static_cast<uint8_t>(pixel >> 8);
-            dmaPixelTile[out + 1U] = static_cast<uint8_t>(pixel);
+            const size_t out = static_cast<size_t>(outRow * tileW + x);
+            spiPixelTile[out] = pixel;
         }
     }
 
-    dmacInfo.p_src = dmaPixelTile;
-    dmacInfo.length = static_cast<uint16_t>(tileW * tileH * 2);
-    dmaTransferBusy = true;
-
-    // Reconfigure the register set once, then use the FSP reset API for each
-    // later tile. Reconfigure also enables the channel; Reset reloads the
-    // source, destination and transfer count and enables it again.
-    if (!dmaConfigured)
+    // Start the pixel stream asynchronously. The buffer remains untouched
+    // until SPI_EVENT_TRANSFER_COMPLETE, so the CPU can rasterize the next
+    // tile into the other ping-pong tile meanwhile.
+    spiCsRaiseOnComplete = true;
+    spiTransferFailed = false;
+    spiTransferBusy = true;
+    const fsp_err_t err = R_SPI_Write(&spiCtrl, spiPixelTile,
+                                      static_cast<uint32_t>(tileW * tileH),
+                                      SPI_BIT_WIDTH_16_BITS);
+    if (err != FSP_SUCCESS)
     {
-        const fsp_err_t reconfigureErr = R_DMAC_Reconfigure(&dmacCtrl, &dmacInfo);
-        assert(reconfigureErr == FSP_SUCCESS && "Unable to configure the SPI DMA transfer");
-        dmaConfigured = true;
+        spiCsRaiseOnComplete = false;
+        spiSetCs(BSP_IO_LEVEL_HIGH);
+        spiTransferBusy = false;
+        return ReturnInfo{ false, EC_InvalidOperation };
     }
-    else
-    {
-        const fsp_err_t resetErr = R_DMAC_Reset(
-            &dmacCtrl, dmaPixelTile,
-            const_cast<uint8_t *>(reinterpret_cast<volatile uint8_t *>(&R_SPI0->SPDR_BY)),
-            static_cast<uint16_t>(tileW * tileH * 2));
-        assert(resetErr == FSP_SUCCESS && "Unable to reset the SPI DMA transfer");
-    }
-
-    // Arm the SPI request only after DMAC is ready. Enabling SPTIE while the
-    // transmit buffer is empty produces the first SPI0_TXI request.
-    R_SPI0->SPCR_b.SPE = 1;
-    R_SPI0->SPCR_b.SPTIE = 1;
 
     return ReturnInfo{ true, EC_OK };
 }
 
-#else // ARDUGL_USE_HW_SPI_DMA == 0
+#else // ARDUGL_USE_HW_SPI_ASYNC == 0
 
 static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
 {
@@ -907,7 +990,7 @@ static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
     return ReturnInfo{ true, EC_OK };
 }
 
-#endif // ARDUGL_USE_HW_SPI_DMA
+#endif // ARDUGL_USE_HW_SPI_ASYNC
 
 // =============================================================================
 // Public entry point — drawFrame
@@ -915,6 +998,9 @@ static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
 
 ArduGL::ReturnInfo ArduGL::drawFrame()
 {
+#if ARDUGL_USE_HW_SPI_ASYNC && ARDUGL_SPI_DEBUG
+    spiDebugReport();
+#endif
     ReturnInfo r = binTriangles();
     if (!r.success)
         return r;
@@ -934,7 +1020,7 @@ ArduGL::ReturnInfo ArduGL::drawFrame()
                 continue;
 
             // Push the previously rasterized (committed) tile to the display.
-            // On the DMA path this returns immediately and the transfer runs
+            // On the async SPI path this returns immediately and the transfer runs
             // in the background while the CPU rasterizes the next tile.
             const int prevTx = (tx > 0) ? tx - 1 : tilesX - 1;
             const int prevTy = (tx > 0) ? ty : ty - 1;

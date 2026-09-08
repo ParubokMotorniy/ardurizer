@@ -3,11 +3,15 @@
 #include <cstddef>
 #include <cstdint>
 
-#ifndef ARDUGL_USE_HW_SPI_DMA
-#define ARDUGL_USE_HW_SPI_DMA 0
+#ifndef ARDUGL_USE_HW_SPI_ASYNC
+#ifdef ARDUGL_USE_HW_SPI_DMA
+#define ARDUGL_USE_HW_SPI_ASYNC ARDUGL_USE_HW_SPI_DMA
+#else
+#define ARDUGL_USE_HW_SPI_ASYNC 1
+#endif
 #endif
 
-#if !ARDUGL_USE_HW_SPI_DMA
+#if !ARDUGL_USE_HW_SPI_ASYNC
 class Adafruit_ST7789;
 #endif
 
@@ -20,8 +24,8 @@ class Adafruit_ST7789;
 //   2 × ARDUGL_TILE_W × ARDUGL_TILE_H × 2 bytes  (RGB565)
 // One depth tile:
 //       ARDUGL_TILE_W × ARDUGL_TILE_H × 1 byte   (uint8)
-// The DMA path also uses one byte-packed RGB565 staging tile.
-// At 16×16: 2×512 + 256 + 512 = 1792 bytes total — very comfortable in
+// The async SPI path also uses one 16-bit RGB565 staging tile.
+// At 32×32: 2×2048 + 1024 + 2048 = 7168 bytes total — very comfortable in
 // 32 KB SRAM.
 #ifndef ARDUGL_TILE_W
 #define ARDUGL_TILE_W 32
@@ -45,7 +49,7 @@ class Adafruit_ST7789;
 #endif
 
 // Maximum number of tiles (tilesX * tilesY).
-// At 240×135 with 16×16 tiles: ceil(240/16)*ceil(135/16) = 15*9 = 135 tiles.
+// At 240×135 with 32×32 tiles: ceil(240/32)*ceil(135/32) = 8*5 = 40 tiles.
 #ifndef ARDUGL_MAX_TILES
 #define ARDUGL_MAX_TILES 135
 #endif
@@ -59,11 +63,23 @@ class Adafruit_ST7789;
 #define ARDUGL_MAX_ATTRS 8
 #endif
 
+// Async FSP SPI clock. The 16-bit pixel path uses one interrupt per pixel.
+#ifndef ARDUGL_SPI_BITRATE
+#define ARDUGL_SPI_BITRATE 12000000UL
+#endif
+
+// Optional USB diagnostics for validating FSP callback activity on hardware.
+#ifndef ARDUGL_SPI_DEBUG
+#define ARDUGL_SPI_DEBUG 0
+#endif
+
 // ---------------------------------------------------------------------------
-// Hardware SPI + DMA gate
+// Hardware SPI + asynchronous transfer gate
 // ---------------------------------------------------------------------------
-// Set to 1 to use the register-level ST7789 + DMA path. The DMA path uses the
-// standard UNO R4 SPI pins (MOSI 11, SCK 13) and the supplied CS/DC pins.
+// Set ARDUGL_USE_HW_SPI_ASYNC to 1 to use the Renesas FSP SPI
+// interrupt-driven ST7789 path. The old ARDUGL_USE_HW_SPI_DMA macro is
+// accepted as a compatibility alias. The async path uses the standard UNO R4
+// SPI pins (MOSI 11, SCK 13) and the supplied CS/DC pins.
 // When 0, scheduleDisplayTransfer() pushes the committed tile synchronously
 // via the Adafruit_ST7789 pointer supplied by initTiledPipeline().
 namespace ArduGL
@@ -90,7 +106,7 @@ enum ErrorCode
     EC_UnsupportedBufferType,
     EC_UnsupportedShaderType,
     EC_InvalidOperation,
-    EC_NotReady, ///< DMA transfer still in progress
+    EC_NotReady, ///< Display transfer still in progress
 };
 
 struct ReturnInfo
@@ -116,8 +132,8 @@ ReturnInfo bindVertexBuffer(char *buffPtr, int buffSize, int itemSize);
 /// Set the render-target size in pixels (e.g. 240 × 135).
 ReturnInfo setRenderTargetDimensions(int width, int height);
 
-#if ARDUGL_USE_HW_SPI_DMA
-/// Initialise the raw ST7789 and DMA tiled pipeline.
+#if ARDUGL_USE_HW_SPI_ASYNC
+/// Initialise the ST7789 and FSP interrupt-driven tiled pipeline.
 void initTiledPipeline(uint8_t csPin, uint8_t dcPin);
 
 /// Fill the raw-initialized display synchronously, for setup diagnostics.
@@ -147,11 +163,11 @@ ReturnInfo unbindShader(ShaderType shType);
 
 /// Render and display one complete frame.
 /// Transforms all geometry, bins triangles into tiles, rasterizes each tile
-/// and pushes it to the display.  On the DMA path each tile's display
+/// and pushes it to the display.  On the async path each tile's display
 /// transfer overlaps with rasterization of the next tile.
 ReturnInfo drawFrame();
 
-/// Returns true while a DMA transfer to the display is in progress.
+/// Returns true while an asynchronous transfer to the display is in progress.
 bool isDisplayTransferBusy();
 
 } // namespace ArduGL
