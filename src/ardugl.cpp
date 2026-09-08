@@ -1,35 +1,3 @@
-// =============================================================================
-// ardugl.cpp  —  ArduGL software rasterizer, tile-based edition
-//
-// Architecture overview
-// ─────────────────────
-// • Two tiny ping-pong COLOR tiles live in SRAM (each TILE_W×TILE_H×2 bytes).
-//   One single DEPTH tile is shared (TILE_W×TILE_H×1 byte).
-//   The async path adds one 16-bit RGB565 staging tile so the CPU can
-//   render the next tile while the SPI ISR transmits the previous one.
-//
-// • Triangle binning: all triangles are transformed once per frame by
-//   binTriangles().  Each triangle is recorded in every tile whose AABB
-//   overlaps the triangle's screen-space AABB.
-//
-// • Per-tile loop (caller side):
-//     binTriangles();
-//     renderTile(0, 0);                          // prime
-//     for each subsequent tile (tx, ty):
-//         scheduleDisplayTransfer(prev_tx, prev_ty); // push committed, flip
-//         renderTile(tx, ty);                        // rasterize into active
-//     scheduleDisplayTransfer(last_tx, last_ty);     // push final tile
-//
-// • Soft-SPI path (ARDUGL_USE_HW_SPI_ASYNC == 0):
-//   scheduleDisplayTransfer() calls tft.setAddrWindow() + tft.writePixels()
-//   synchronously for the committed tile, then flips active/committed.
-//
-// • Async SPI path (ARDUGL_USE_HW_SPI_ASYNC == 1): scheduleDisplayTransfer()
-//   blocks until the previous FSP transfer finishes, then starts the
-//   committed tile with R_SPI_Write() and flips. The CPU overlaps the next
-//   renderTile() with the ongoing interrupt-driven SPI transfer.
-// =============================================================================
-
 #include "ardugl.h"
 
 #include "glm.hpp"
@@ -39,8 +7,8 @@
 #if !ARDUGL_USE_HW_SPI_ASYNC
 #include <Adafruit_ST7789.h>
 #else
-#include "r_spi.h"
 #include "IRQManager.h"
+#include "r_spi.h"
 #endif
 
 #include <cassert>
@@ -95,14 +63,10 @@ static Buffer vertexBuffer;
 static AABB renderTargetDimensions; // kept for mapToScreen(); mirrors renderW/renderH
 
 // --- In-RAM ping-pong color tiles + single depth tile ---
-// pingPongTile[0] and [1] alternate: one is being rasterized into while
-// the other is being (or has just been) sent to the display.
-// depthTile is shared — it is cleared at the start of every renderTile().
 static uint16_t pingPongTile[2][ARDUGL_TILE_W * ARDUGL_TILE_H];
 static uint8_t depthTile[ARDUGL_TILE_W * ARDUGL_TILE_H];
 
 // Clear color applied at the start of every renderTile() call.
-// Stored pre-packed as RGB565 to avoid re-packing per tile.
 static uint16_t clearColorPacked = 0x18C6; // packRGB565({0.2, 0.2, 0.2})
 
 // Ping-pong indices.
@@ -125,7 +89,6 @@ static uint8_t tileBinCount[ARDUGL_MAX_TILES]; // number of entries per tile
 static CachedTriangle cachedTriangles[ARDUGL_MAX_TRIANGLES];
 
 // --- Display handle (soft-SPI path) ---
-// Set by initTiledPipeline(); used by scheduleDisplayTransfer().
 #if !ARDUGL_USE_HW_SPI_ASYNC
 static Adafruit_ST7789 *s_tft = nullptr;
 #endif
@@ -145,11 +108,6 @@ static spi_extended_cfg_t spiExtCfg{};
 static bool spiOpened = false;
 static volatile bool spiCsRaiseOnComplete = false;
 static volatile bool spiTransferFailed = false;
-#if ARDUGL_SPI_DEBUG
-static volatile uint32_t spiCompletedTransfers = 0;
-static volatile uint32_t spiErrorTransfers = 0;
-static uint32_t spiLastDebugReportMs = 0;
-#endif
 static uint8_t spiCsPin = 10;
 static uint8_t spiDcPin = 9;
 // Adafruit's 135x240 ST7789 initialization uses x=40 and y=52 for rotation 1.
@@ -222,10 +180,6 @@ static void initAsyncSpiPipeline(uint8_t csPin, uint8_t dcPin)
     if (spiOpened)
         return;
 
-#if ARDUGL_SPI_DEBUG
-    Serial.begin(115200);
-#endif
-
     activeTileIdx = 0;
     committedTileIdx = 1;
     spiCsPin = csPin;
@@ -240,15 +194,13 @@ static void initAsyncSpiPipeline(uint8_t csPin, uint8_t dcPin)
 
     // The FSP SPI driver does not configure Arduino pin muxing. Configure the
     // UNO R4's hardware SPI pins directly, then let R_SPI_Open own SPI0.
-    const fsp_err_t mosiPinErr
-        = R_IOPORT_PinCfg(&g_ioport_ctrl, digitalPinToBspPin(11),
-                          IOPORT_CFG_PERIPHERAL_PIN | IOPORT_PERIPHERAL_SPI);
+    const fsp_err_t mosiPinErr = R_IOPORT_PinCfg(&g_ioport_ctrl, digitalPinToBspPin(11),
+                                                 IOPORT_CFG_PERIPHERAL_PIN | IOPORT_PERIPHERAL_SPI);
     assert(mosiPinErr == FSP_SUCCESS && "Unable to mux D11 as SPI MOSI");
     // The ST7789 is write-only here, so no MISO pin is required. D12 remains
     // available as an ordinary GPIO.
-    const fsp_err_t sckPinErr
-        = R_IOPORT_PinCfg(&g_ioport_ctrl, digitalPinToBspPin(13),
-                          IOPORT_CFG_PERIPHERAL_PIN | IOPORT_PERIPHERAL_SPI);
+    const fsp_err_t sckPinErr = R_IOPORT_PinCfg(&g_ioport_ctrl, digitalPinToBspPin(13),
+                                                IOPORT_CFG_PERIPHERAL_PIN | IOPORT_PERIPHERAL_SPI);
     assert(sckPinErr == FSP_SUCCESS && "Unable to mux D13 as SPI clock");
 
     spiCfg.channel = 0;
@@ -282,8 +234,7 @@ static void initAsyncSpiPipeline(uint8_t csPin, uint8_t dcPin)
     spiExtCfg.ssl_negation_delay = SPI_DELAY_COUNT_1;
     spiExtCfg.next_access_delay = SPI_DELAY_COUNT_1;
     // FSP transmits one MSB-first RGB565 halfword per pixel.
-    const fsp_err_t bitrateErr = R_SPI_CalculateBitrate(ARDUGL_SPI_BITRATE,
-                                                        &spiExtCfg.spck_div);
+    const fsp_err_t bitrateErr = R_SPI_CalculateBitrate(ARDUGL_SPI_BITRATE, &spiExtCfg.spck_div);
     assert(bitrateErr == FSP_SUCCESS && "Unable to calculate SPI bitrate");
 
     // Arduino's SPI wrapper intentionally leaves these vectors invalid because
@@ -302,10 +253,7 @@ static void initAsyncSpiPipeline(uint8_t csPin, uint8_t dcPin)
     spiInitSt7789();
 }
 
-void ArduGL::initTiledPipeline(uint8_t csPin, uint8_t dcPin)
-{
-    initAsyncSpiPipeline(csPin, dcPin);
-}
+void ArduGL::initTiledPipeline(uint8_t csPin, uint8_t dcPin) { initAsyncSpiPipeline(csPin, dcPin); }
 #else
 void ArduGL::initTiledPipeline(Adafruit_ST7789 *tft, uint8_t csPin, uint8_t dcPin)
 {
@@ -456,10 +404,6 @@ static void shadeFragment(int fragX, int fragY, int bufOffsetX, int bufOffsetY, 
         interp[a] = glm::dot(bary, glm::vec3(attrs1[a], attrs2[a], attrs3[a]) * oneOverWs)
                     / oneOverW;
     }
-
-    // Pass as std::vector to keep the fragment shader signature unchanged.
-    // This is a single small heap allocation per shaded fragment; acceptable
-    // for now — can be eliminated later by changing the shader signature.
     const std::vector<float> interpVec(interp, interp + numAttrs);
     colorBuf[localIdx] = packRGB565(fragmentShaderPtr(interpVec));
 }
@@ -650,22 +594,6 @@ static ArduGL::ReturnInfo renderTile(int tileCol, int tileRow)
 
 // =============================================================================
 // Tiled pipeline — scheduleDisplayTransfer
-//
-// Pushes the committed (last finished) tile to the display, then flips
-// the ping-pong indices so the next renderTile() writes into the other tile.
-//
-// tileCol / tileRow identify the screen window for the committed tile.
-// They refer to the tile that was rendered in the PREVIOUS renderTile() call,
-// i.e. the caller's loop looks like:
-//
-//   renderTile(0, 0);                         // fill tile 0 into active
-//   for each subsequent tile (tx, ty):
-//       scheduleDisplayTransfer(prev_tx, prev_ty);  // push committed, flip
-//       renderTile(tx, ty);                         // fill next tile
-//   scheduleDisplayTransfer(last_tx, last_ty);      // push final tile
-//
-// With async SPI enabled the push is asynchronous: the CPU starts renderTile()
-// for the next tile while the FSP SPI ISR streams the committed tile.
 // =============================================================================
 
 bool ArduGL::isDisplayTransferBusy() { return spiTransferBusy; }
@@ -681,9 +609,6 @@ static void spiCallback(spi_callback_args_t *p_args)
 
     if (p_args->event == SPI_EVENT_TRANSFER_COMPLETE)
     {
-#if ARDUGL_SPI_DEBUG
-        ++spiCompletedTransfers;
-#endif
         if (spiCsRaiseOnComplete)
         {
             // End the display transaction before changing D/C. The panel
@@ -697,9 +622,6 @@ static void spiCallback(spi_callback_args_t *p_args)
         return;
     }
 
-#if ARDUGL_SPI_DEBUG
-    ++spiErrorTransfers;
-#endif
     spiTransferFailed = true;
     if (spiCsRaiseOnComplete)
     {
@@ -709,29 +631,6 @@ static void spiCallback(spi_callback_args_t *p_args)
     }
     spiTransferBusy = false;
 }
-
-#if ARDUGL_SPI_DEBUG
-static void spiDebugReport()
-{
-    const uint32_t now = millis();
-    if (now - spiLastDebugReportMs < 1000)
-        return;
-    spiLastDebugReportMs = now;
-
-    noInterrupts();
-    const uint32_t completed = spiCompletedTransfers;
-    const uint32_t errors = spiErrorTransfers;
-    const bool busy = spiTransferBusy;
-    interrupts();
-
-    Serial.print("FSP SPI completed=");
-    Serial.print(completed);
-    Serial.print(" errors=");
-    Serial.print(errors);
-    Serial.print(" busy=");
-    Serial.println(busy ? 1 : 0);
-}
-#endif
 
 // ---------------------------------------------------------------------------
 // SPI helpers for the FSP interrupt-driven path
@@ -826,8 +725,7 @@ static void spiSetAddrWindow(uint16_t x0, uint16_t y0, uint16_t w, uint16_t h)
     // DC is now high (data); leave CS asserted for the async pixel burst.
 }
 
-static void spiSendCommand(uint8_t command, const uint8_t *data = nullptr,
-                            size_t dataLength = 0)
+static void spiSendCommand(uint8_t command, const uint8_t *data = nullptr, size_t dataLength = 0)
 {
     spiSetCs(BSP_IO_LEVEL_LOW);
     spiSetDc(BSP_IO_LEVEL_LOW);
@@ -935,8 +833,7 @@ static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
     spiCsRaiseOnComplete = true;
     spiTransferFailed = false;
     spiTransferBusy = true;
-    const fsp_err_t err = R_SPI_Write(&spiCtrl, spiPixelTile,
-                                      static_cast<uint32_t>(tileW * tileH),
+    const fsp_err_t err = R_SPI_Write(&spiCtrl, spiPixelTile, static_cast<uint32_t>(tileW * tileH),
                                       SPI_BIT_WIDTH_16_BITS);
     if (err != FSP_SUCCESS)
     {
@@ -953,9 +850,8 @@ static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
 
 static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
 {
-    s_tft->SPI_CS_HIGH();
-
     assert(s_tft && "initTiledPipeline() not called");
+    s_tft->SPI_CS_HIGH();
 
     // Flip ping-pong: active (just rasterized) becomes committed (to display).
     committedTileIdx = activeTileIdx;
@@ -998,9 +894,6 @@ static ArduGL::ReturnInfo scheduleDisplayTransfer(int tileCol, int tileRow)
 
 ArduGL::ReturnInfo ArduGL::drawFrame()
 {
-#if ARDUGL_USE_HW_SPI_ASYNC && ARDUGL_SPI_DEBUG
-    spiDebugReport();
-#endif
     ReturnInfo r = binTriangles();
     if (!r.success)
         return r;

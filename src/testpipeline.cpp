@@ -125,8 +125,6 @@ void initializePipeline()
     delay(500);
     tft.fillScreen(ST77XX_BLACK);
 
-    // single pixel to confirm display is alive
-    tft.drawPixel(tft.width() / 2, tft.height() / 2, ST77XX_GREEN);
     ArduGL::initTiledPipeline(&tft, /*csPin=*/10, /*dcPin=*/9);
 #endif
 }

@@ -4,11 +4,7 @@
 #include <cstdint>
 
 #ifndef ARDUGL_USE_HW_SPI_ASYNC
-#ifdef ARDUGL_USE_HW_SPI_DMA
-#define ARDUGL_USE_HW_SPI_ASYNC ARDUGL_USE_HW_SPI_DMA
-#else
 #define ARDUGL_USE_HW_SPI_ASYNC 1
-#endif
 #endif
 
 #if !ARDUGL_USE_HW_SPI_ASYNC
@@ -68,17 +64,11 @@ class Adafruit_ST7789;
 #define ARDUGL_SPI_BITRATE 12000000UL
 #endif
 
-// Optional USB diagnostics for validating FSP callback activity on hardware.
-#ifndef ARDUGL_SPI_DEBUG
-#define ARDUGL_SPI_DEBUG 0
-#endif
-
 // ---------------------------------------------------------------------------
 // Hardware SPI + asynchronous transfer gate
 // ---------------------------------------------------------------------------
 // Set ARDUGL_USE_HW_SPI_ASYNC to 1 to use the Renesas FSP SPI
-// interrupt-driven ST7789 path. The old ARDUGL_USE_HW_SPI_DMA macro is
-// accepted as a compatibility alias. The async path uses the standard UNO R4
+// interrupt-driven ST7789 path. The async path uses the standard UNO R4
 // SPI pins (MOSI 11, SCK 13) and the supplied CS/DC pins.
 // When 0, scheduleDisplayTransfer() pushes the committed tile synchronously
 // via the Adafruit_ST7789 pointer supplied by initTiledPipeline().
