@@ -4,27 +4,22 @@
 #include <ext/matrix_clip_space.hpp>
 #include <ext/matrix_transform.hpp>
 
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
 #include <Arduino.h>
 #include <cstdint>
 #include <vector>
 
-#define ENABLE_SERIAL_FRAME_DUMP 0
+#if !ARDUGL_USE_HW_SPI_ASYNC
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#endif
 
 #undef radians
 
 namespace
 {
 
-constexpr int screenWidth = 240 / 4;
-constexpr int screenHeight = 135 / 4;
-
-constexpr int depthBufferSize = screenWidth * screenHeight * sizeof(unsigned char);
-char *depthBuffer = new char[depthBufferSize];
-
-constexpr int colorBufferSize = screenWidth * screenHeight * sizeof(uint16_t);
-char *colorBuffer = new char[colorBufferSize];
+constexpr int fullScreenWidth = 7 * 32;
+constexpr int fullScreenHeight = 4 * 32;
 
 struct Vertex
 {
@@ -49,8 +44,8 @@ Vertex *vertexBuffer = new Vertex[6 * 6]{
     Vertex{ {0.0, 2.0, 0.0}, {0.35, 1.00, 0.65} }, Vertex{ {2.0, 2.0, 0.0}, {0.52, 0.90, 0.80} }, Vertex{ {2.0, 0.0, 0.0}, {0.22, 0.72, 0.55} } // clang-format on
 };
 
-glm::mat4 proj = glm::perspective(glm::radians(45.0), (double)screenWidth / (double)screenHeight,
-                                  0.1, 1000.0);
+glm::mat4 proj = glm::perspective(glm::radians(45.0),
+                                  (double)fullScreenWidth / (double)fullScreenHeight, 0.1, 1000.0);
 glm::mat4 view = glm::translate(glm::mat4(1.0), glm::vec3(0.0, 0.0, -5.0));
 
 float runningParameter = 0.0;
@@ -69,7 +64,9 @@ glm::mat4 buildModelMatrix()
 
 glm::mat4 currentModelMatrix = buildModelMatrix();
 
-Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 12, /*MOSI*/ 11, /*SCK*/ 13);
+#if !ARDUGL_USE_HW_SPI_ASYNC
+Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 9, 11, 13);
+#endif
 
 } // namespace
 
@@ -99,19 +96,25 @@ glm::vec3 cubeFragmentShader(const std::vector<float> &interpolatedAttributes)
 
 void initializePipeline()
 {
-    ArduGL::setRenderTargetDimensions(screenWidth, screenHeight);
-
-    ArduGL::bindBuffer(ArduGL::BufferType::BT_Depth, depthBuffer, depthBufferSize,
-                       sizeof(unsigned char));
-    ArduGL::bindBuffer(ArduGL::BufferType::BT_Color, colorBuffer, colorBufferSize,
-                       sizeof(uint16_t));
-    ArduGL::bindBuffer(ArduGL::BufferType::BT_VertexAttribute,
-                       reinterpret_cast<char *>(vertexBuffer), vertexBufferSize, sizeof(Vertex));
-
+    ArduGL::bindVertexBuffer(reinterpret_cast<char *>(vertexBuffer), vertexBufferSize,
+                             sizeof(Vertex));
     ArduGL::bindShader(ArduGL::ShaderType::ST_Vertex, reinterpret_cast<void *>(&cubeVertexShader));
     ArduGL::bindShader(ArduGL::ShaderType::ST_Fragment,
                        reinterpret_cast<void *>(&cubeFragmentShader));
 
+    ArduGL::setRenderTargetDimensions(fullScreenWidth, fullScreenHeight);
+    ArduGL::setClearColor(0.05f, 0.7f, 0.5f);
+
+#if ARDUGL_USE_HW_SPI_ASYNC
+    ArduGL::initTiledPipeline(/*csPin=*/10, /*dcPin=*/9);
+    ArduGL::fillDisplay(0x07E0); // green
+    delay(500);
+    ArduGL::fillDisplay(0x001F); // blue
+    delay(500);
+    ArduGL::fillDisplay(0xF800); // red
+    delay(500);
+    ArduGL::fillDisplay(0x0000); // black
+#else
     tft.init(135, 240);
     tft.setRotation(1);
     tft.fillScreen(ST77XX_GREEN);
@@ -122,45 +125,16 @@ void initializePipeline()
     delay(500);
     tft.fillScreen(ST77XX_BLACK);
 
-#if ENABLE_SERIAL_FRAME_DUMP
-    Serial.begin(115200, SERIAL_8N1);
+    ArduGL::initTiledPipeline(&tft, /*csPin=*/10, /*dcPin=*/9);
 #endif
-
-    // a single pixel
-    tft.drawPixel(tft.width() / 2, tft.height() / 2, ST77XX_GREEN);
 }
 
 void drawCube()
 {
-    ArduGL::clearBuffer(ArduGL::BufferType::BT_Depth, 1.0);
-    ArduGL::clearBuffer(ArduGL::BufferType::BT_Color, 0.2);
-
     currentModelMatrix = buildModelMatrix();
-    runningParameter += 0.025;
-    if (runningParameter > 1.0)
-        runningParameter -= 1.0;
+    runningParameter += 0.025f;
+    if (runningParameter > 1.0f)
+        runningParameter -= 1.0f;
 
-    ArduGL::renderPrimitives();
-
-    // this prevents screen blinking
-    tft.SPI_CS_HIGH();
-
-    tft.startWrite();
-    const int renderTargetX = (tft.width() - screenWidth) / 2;
-    const int renderTargetY = (tft.height() - screenHeight) / 2;
-    tft.setAddrWindow(renderTargetX, renderTargetY, screenWidth, screenHeight);
-    tft.writePixels(reinterpret_cast<uint16_t *>(colorBuffer), screenWidth * screenHeight, true);
-    tft.endWrite();
-
-    tft.SPI_CS_LOW();
-
-#if ENABLE_SERIAL_FRAME_DUMP
-    Serial.write("FRAME_SEP");
-    Serial.write(colorBuffer, colorBufferSize);
-    Serial.write(depthBuffer, depthBufferSize);
-    Serial.flush();
-#endif
-
-    // TODO: upscale buffers on their way out? OR keep the buffers in flsah for increased storage ->
-    // with reads/writes to flash, it's effectively mobile tile rendering
+    ArduGL::drawFrame();
 }
