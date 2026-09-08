@@ -3,7 +3,13 @@
 #include <cstddef>
 #include <cstdint>
 
+#ifndef ARDUGL_USE_HW_SPI_DMA
+#define ARDUGL_USE_HW_SPI_DMA 0
+#endif
+
+#if !ARDUGL_USE_HW_SPI_DMA
 class Adafruit_ST7789;
+#endif
 
 // ---------------------------------------------------------------------------
 // Compile-time configuration
@@ -14,7 +20,9 @@ class Adafruit_ST7789;
 //   2 × ARDUGL_TILE_W × ARDUGL_TILE_H × 2 bytes  (RGB565)
 // One depth tile:
 //       ARDUGL_TILE_W × ARDUGL_TILE_H × 1 byte   (uint8)
-// At 16×16: 2×512 + 256 = 1280 bytes total — very comfortable in 32 KB SRAM.
+// The DMA path also uses one byte-packed RGB565 staging tile.
+// At 16×16: 2×512 + 256 + 512 = 1792 bytes total — very comfortable in
+// 32 KB SRAM.
 #ifndef ARDUGL_TILE_W
 #define ARDUGL_TILE_W 32
 #endif
@@ -54,14 +62,10 @@ class Adafruit_ST7789;
 // ---------------------------------------------------------------------------
 // Hardware SPI + DMA gate
 // ---------------------------------------------------------------------------
-// Set to 1 after rewiring DC from pin 12 to pin 9 and switching to the
-// 2-argument Adafruit_ST7789 constructor (hardware SPI).
+// Set to 1 to use the register-level ST7789 + DMA path. The DMA path uses the
+// standard UNO R4 SPI pins (MOSI 11, SCK 13) and the supplied CS/DC pins.
 // When 0, scheduleDisplayTransfer() pushes the committed tile synchronously
 // via the Adafruit_ST7789 pointer supplied by initTiledPipeline().
-#ifndef ARDUGL_USE_HW_SPI_DMA
-#define ARDUGL_USE_HW_SPI_DMA 1
-#endif
-
 namespace ArduGL
 {
 
@@ -112,12 +116,17 @@ ReturnInfo bindVertexBuffer(char *buffPtr, int buffSize, int itemSize);
 /// Set the render-target size in pixels (e.g. 240 × 135).
 ReturnInfo setRenderTargetDimensions(int width, int height);
 
-/// Initialise the tiled pipeline.  Must be called once after tft.init().
-/// tft  — Adafruit display object (must remain valid for the lifetime of the pipeline)
-/// csPin / dcPin — Arduino pin numbers for chip-select and data/command.
-///   Soft-SPI path: these are passed through to the Adafruit driver.
-///   DMA path:      used directly for raw GPIO + SPI register access.
+#if ARDUGL_USE_HW_SPI_DMA
+/// Initialise the raw ST7789 and DMA tiled pipeline.
+void initTiledPipeline(uint8_t csPin, uint8_t dcPin);
+
+/// Fill the raw-initialized display synchronously, for setup diagnostics.
+void fillDisplay(uint16_t color);
+#else
+/// Initialise the tiled pipeline after tft.init().
+/// tft must remain valid for the lifetime of the synchronous pipeline.
 void initTiledPipeline(Adafruit_ST7789 *tft, uint8_t csPin, uint8_t dcPin);
+#endif
 
 // ---------------------------------------------------------------------------
 // Shader management

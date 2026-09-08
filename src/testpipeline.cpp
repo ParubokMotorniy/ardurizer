@@ -4,11 +4,14 @@
 #include <ext/matrix_clip_space.hpp>
 #include <ext/matrix_transform.hpp>
 
-#include <Adafruit_GFX.h>
-#include <Adafruit_ST7789.h>
 #include <Arduino.h>
 #include <cstdint>
 #include <vector>
+
+#if !ARDUGL_USE_HW_SPI_DMA
+#include <Adafruit_GFX.h>
+#include <Adafruit_ST7789.h>
+#endif
 
 #undef radians
 
@@ -61,7 +64,9 @@ glm::mat4 buildModelMatrix()
 
 glm::mat4 currentModelMatrix = buildModelMatrix();
 
-Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 9, -1);
+#if !ARDUGL_USE_HW_SPI_DMA
+Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 12, 11, 13);
+#endif
 
 } // namespace
 
@@ -97,6 +102,19 @@ void initializePipeline()
     ArduGL::bindShader(ArduGL::ShaderType::ST_Fragment,
                        reinterpret_cast<void *>(&cubeFragmentShader));
 
+    ArduGL::setRenderTargetDimensions(fullScreenWidth, fullScreenHeight);
+    ArduGL::setClearColor(0.05f, 0.7f, 0.5f);
+
+#if ARDUGL_USE_HW_SPI_DMA
+    ArduGL::initTiledPipeline(/*csPin=*/10, /*dcPin=*/9);
+    ArduGL::fillDisplay(0x07E0); // green
+    delay(500);
+    ArduGL::fillDisplay(0x001F); // blue
+    delay(500);
+    ArduGL::fillDisplay(0xF800); // red
+    delay(500);
+    ArduGL::fillDisplay(0x0000); // black
+#else
     tft.init(135, 240);
     tft.setRotation(1);
     tft.fillScreen(ST77XX_GREEN);
@@ -107,12 +125,10 @@ void initializePipeline()
     delay(500);
     tft.fillScreen(ST77XX_BLACK);
 
-    ArduGL::setRenderTargetDimensions(fullScreenWidth, fullScreenHeight);
-    ArduGL::setClearColor(0.05f, 0.7f, 0.5f);
-    ArduGL::initTiledPipeline(&tft, /*csPin=*/10, /*dcPin=*/9);
-
     // single pixel to confirm display is alive
     tft.drawPixel(tft.width() / 2, tft.height() / 2, ST77XX_GREEN);
+    ArduGL::initTiledPipeline(&tft, /*csPin=*/10, /*dcPin=*/9);
+#endif
 }
 
 void drawCube()
