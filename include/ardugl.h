@@ -117,7 +117,7 @@ void setClearColor(float r, float g, float b);
 /// buffPtr  — pointer to packed vertex data
 /// buffSize — total size in bytes
 /// itemSize — size of one vertex in bytes
-ReturnInfo bindVertexBuffer(char *buffPtr, int buffSize, int itemSize);
+ReturnInfo bindVertexBuffer(const char *buffPtr, int buffSize, int itemSize);
 
 /// Set the render-target size in pixels (e.g. 240 × 135).
 ReturnInfo setRenderTargetDimensions(int width, int height);

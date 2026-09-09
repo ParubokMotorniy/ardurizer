@@ -29,7 +29,7 @@ using namespace ArduGL;
 
 struct Buffer
 {
-    char *buffPtr = nullptr;
+    const char *buffPtr = nullptr;
     int buffSize = 0;
     int itemSize = 0;
 };
@@ -157,7 +157,7 @@ void ArduGL::setClearColor(float r, float g, float b)
     clearColorPacked = packRGB565(glm::vec3(r, g, b));
 }
 
-ArduGL::ReturnInfo ArduGL::bindVertexBuffer(char *buffPtr, int buffSize, int itemSize)
+ArduGL::ReturnInfo ArduGL::bindVertexBuffer(const char *buffPtr, int buffSize, int itemSize)
 {
     vertexBuffer = Buffer{ .buffPtr = buffPtr, .buffSize = buffSize, .itemSize = itemSize };
     return ReturnInfo{ true, EC_OK };
