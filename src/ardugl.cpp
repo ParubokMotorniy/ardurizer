@@ -82,7 +82,7 @@ static int renderH = 0;
 // --- Triangle bin ---
 // For each tile: a list of triangle indices (into cachedTriangles[]) that
 // overlap that tile.  Stored as a flat 2-D array.
-static uint16_t tileBins[ARDUGL_MAX_TILES][ARDUGL_MAX_TRIS_PER_TILE];
+static uint8_t tileBins[ARDUGL_MAX_TILES][ARDUGL_MAX_TRIS_PER_TILE];
 static uint8_t tileBinCount[ARDUGL_MAX_TILES]; // number of entries per tile
 
 // Cached per-frame triangle data produced by binTriangles().

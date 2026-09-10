@@ -35,19 +35,19 @@ class Adafruit_ST7789;
 // tileBins[ARDUGL_MAX_TILES][ARDUGL_MAX_TRIS_PER_TILE] × 2 bytes must fit in SRAM.
 // At 135 tiles × 12 entries: 135 × 12 × 2 = 3 240 bytes.
 #ifndef ARDUGL_MAX_TRIS_PER_TILE
-#define ARDUGL_MAX_TRIS_PER_TILE 12
+#define ARDUGL_MAX_TRIS_PER_TILE 10
 #endif
 
 // Maximum total triangles per frame (= vertex buffer capacity / 3).
 // The cube has 36 triangles; 48 gives a comfortable margin.
 #ifndef ARDUGL_MAX_TRIANGLES
-#define ARDUGL_MAX_TRIANGLES 48
+#define ARDUGL_MAX_TRIANGLES 60
 #endif
 
 // Maximum number of tiles (tilesX * tilesY).
 // At 240×135 with 32×32 tiles: ceil(240/32)*ceil(135/32) = 8*5 = 40 tiles.
 #ifndef ARDUGL_MAX_TILES
-#define ARDUGL_MAX_TILES 135
+#define ARDUGL_MAX_TILES 30
 #endif
 
 // Maximum number of float attributes passed from vertex shader to fragment
@@ -56,7 +56,7 @@ class Adafruit_ST7789;
 // CachedTriangle size = 3×vec4 + 3×ARDUGL_MAX_ATTRS×float + 1 bool
 //   = 48 + 3×8×4 + 4 = 148 bytes × 48 triangles = 7 104 bytes.
 #ifndef ARDUGL_MAX_ATTRS
-#define ARDUGL_MAX_ATTRS 8
+#define ARDUGL_MAX_ATTRS 6
 #endif
 
 // Async FSP SPI clock. The 16-bit pixel path uses one interrupt per pixel.
