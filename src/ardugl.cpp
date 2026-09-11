@@ -29,7 +29,7 @@ using namespace ArduGL;
 
 struct Buffer
 {
-    char *buffPtr = nullptr;
+    const char *buffPtr = nullptr;
     int buffSize = 0;
     int itemSize = 0;
 };
@@ -59,6 +59,7 @@ struct CachedTriangle
 // =============================================================================
 
 static Buffer vertexBuffer;
+static Buffer indexBuffer;
 
 static AABB renderTargetDimensions; // kept for mapToScreen(); mirrors renderW/renderH
 
@@ -82,7 +83,7 @@ static int renderH = 0;
 // --- Triangle bin ---
 // For each tile: a list of triangle indices (into cachedTriangles[]) that
 // overlap that tile.  Stored as a flat 2-D array.
-static uint16_t tileBins[ARDUGL_MAX_TILES][ARDUGL_MAX_TRIS_PER_TILE];
+static uint8_t tileBins[ARDUGL_MAX_TILES][ARDUGL_MAX_TRIS_PER_TILE];
 static uint8_t tileBinCount[ARDUGL_MAX_TILES]; // number of entries per tile
 
 // Cached per-frame triangle data produced by binTriangles().
@@ -157,9 +158,15 @@ void ArduGL::setClearColor(float r, float g, float b)
     clearColorPacked = packRGB565(glm::vec3(r, g, b));
 }
 
-ArduGL::ReturnInfo ArduGL::bindVertexBuffer(char *buffPtr, int buffSize, int itemSize)
+ArduGL::ReturnInfo ArduGL::bindVertexBuffer(const char *buffPtr, int buffSize, int itemSize)
 {
     vertexBuffer = Buffer{ .buffPtr = buffPtr, .buffSize = buffSize, .itemSize = itemSize };
+    return ReturnInfo{ true, EC_OK };
+}
+
+ReturnInfo ArduGL::bindIndexBuffer(const char *buffPtr, int buffSize, int itemSize)
+{
+    indexBuffer = Buffer{ .buffPtr = buffPtr, .buffSize = buffSize, .itemSize = itemSize };
     return ReturnInfo{ true, EC_OK };
 }
 
@@ -412,89 +419,126 @@ static void shadeFragment(int fragX, int fragY, int bufOffsetX, int bufOffsetY, 
 // Tiled pipeline — binTriangles
 // =============================================================================
 
+static void binTriangle(int triangleIndex, const char *v0, const char *v1, const char *v2,
+                        int tilesX, int tilesY)
+{
+    VertexShaderOutput tv1 = vertexShaderPtr(v0);
+    VertexShaderOutput tv2 = vertexShaderPtr(v1);
+    VertexShaderOutput tv3 = vertexShaderPtr(v2);
+
+    perspectiveDivide(tv1.first);
+    perspectiveDivide(tv2.first);
+    perspectiveDivide(tv3.first);
+
+    mapToScreen(tv1.first);
+    mapToScreen(tv2.first);
+    mapToScreen(tv3.first);
+
+    // Back-face cull.
+    if (computeTriCrossProduct(tv1.first, tv2.first, tv3.first).z >= 0.0f)
+    {
+        cachedTriangles[triangleIndex].valid = false;
+        return;
+    }
+
+    const AABB triAABB = computeTriangleAABB(tv1.first, tv2.first, tv3.first);
+
+    // Frustum cull.
+    if (!checkAABBIntersect(renderTargetDimensions, triAABB))
+    {
+        cachedTriangles[triangleIndex].valid = false;
+        return;
+    }
+
+    // Cache the transformed triangle.
+    const int nAttrs = static_cast<int>(tv1.second.size());
+    assert(nAttrs <= ARDUGL_MAX_ATTRS && "Increase ARDUGL_MAX_ATTRS");
+    cachedTriangles[triangleIndex].valid = true;
+    cachedTriangles[triangleIndex].sv[0] = tv1.first;
+    cachedTriangles[triangleIndex].sv[1] = tv2.first;
+    cachedTriangles[triangleIndex].sv[2] = tv3.first;
+    cachedTriangles[triangleIndex].numAttrs = nAttrs;
+    for (int a = 0; a < nAttrs; ++a)
+    {
+        cachedTriangles[triangleIndex].attrs[0][a] = tv1.second[a];
+        cachedTriangles[triangleIndex].attrs[1][a] = tv2.second[a];
+        cachedTriangles[triangleIndex].attrs[2][a] = tv3.second[a];
+    }
+
+    // Bin into every tile whose rectangle overlaps the triangle bounds.
+    for (int ty = 0; ty < tilesY; ++ty)
+    {
+        for (int tx = 0; tx < tilesX; ++tx)
+        {
+            const AABB tileAABB{ .blX = static_cast<float>(tx * ARDUGL_TILE_W),
+                                 .blY = static_cast<float>(ty * ARDUGL_TILE_H),
+                                 .width = static_cast<float>(ARDUGL_TILE_W),
+                                 .height = static_cast<float>(ARDUGL_TILE_H) };
+            if (!checkAABBIntersect(triAABB, tileAABB))
+                continue;
+
+            const int tileIndex = ty * tilesX + tx;
+            if (tileBinCount[tileIndex] < ARDUGL_MAX_TRIS_PER_TILE)
+            {
+                tileBins[tileIndex][tileBinCount[tileIndex]++] = static_cast<uint8_t>(
+                    triangleIndex);
+            }
+        }
+    }
+}
+
+static uint32_t readIndex(const char *data, int itemSize)
+{
+    uint32_t index = 0;
+    memcpy(&index, data, static_cast<size_t>(itemSize));
+    return index;
+}
+
 static ArduGL::ReturnInfo binTriangles()
 {
     assert(vertexShaderPtr && "Vertex shader not bound");
     assert(vertexBuffer.buffPtr && "Vertex buffer not bound");
-
-    const int totalTriangles = vertexBuffer.buffSize / (3 * vertexBuffer.itemSize);
-    assert(totalTriangles <= ARDUGL_MAX_TRIANGLES && "Increase ARDUGL_MAX_TRIANGLES");
 
     const int tilesX = getTilesX();
     const int tilesY = getTilesY();
     const int totalTiles = tilesX * tilesY;
     assert(totalTiles <= ARDUGL_MAX_TILES && "Increase ARDUGL_MAX_TILES");
 
+    const bool indexed = indexBuffer.buffPtr != nullptr;
+    const Buffer &primitiveBuffer = indexed ? indexBuffer : vertexBuffer;
+    assert(primitiveBuffer.itemSize > 0 && "Invalid primitive buffer item size");
+
+    const int totalTriangles = primitiveBuffer.buffSize / (3 * primitiveBuffer.itemSize);
+    assert(totalTriangles <= ARDUGL_MAX_TRIANGLES && "Increase ARDUGL_MAX_TRIANGLES");
     memset(tileBinCount, 0, sizeof(uint8_t) * totalTiles);
 
-    for (int t = 0; t < totalTriangles; ++t)
+    if (indexed)
     {
-        const char *base = vertexBuffer.buffPtr + t * 3 * vertexBuffer.itemSize;
-
-        VertexShaderOutput tv1 = vertexShaderPtr(base + vertexBuffer.itemSize * 0);
-        VertexShaderOutput tv2 = vertexShaderPtr(base + vertexBuffer.itemSize * 1);
-        VertexShaderOutput tv3 = vertexShaderPtr(base + vertexBuffer.itemSize * 2);
-
-        perspectiveDivide(tv1.first);
-        perspectiveDivide(tv2.first);
-        perspectiveDivide(tv3.first);
-
-        mapToScreen(tv1.first);
-        mapToScreen(tv2.first);
-        mapToScreen(tv3.first);
-
-        // Back-face cull
-        if (computeTriCrossProduct(tv1.first, tv2.first, tv3.first).z >= 0.0f)
+        assert(indexBuffer.itemSize == 1 || indexBuffer.itemSize == 2 || indexBuffer.itemSize == 4);
+        const int vertexCount = vertexBuffer.buffSize / vertexBuffer.itemSize;
+        for (int triangle = 0; triangle < totalTriangles; ++triangle)
         {
-            cachedTriangles[t].valid = false;
-            continue;
+            const char *indices = indexBuffer.buffPtr + triangle * 3 * indexBuffer.itemSize;
+            const uint32_t i0 = readIndex(indices + 0 * indexBuffer.itemSize, indexBuffer.itemSize);
+            const uint32_t i1 = readIndex(indices + 1 * indexBuffer.itemSize, indexBuffer.itemSize);
+            const uint32_t i2 = readIndex(indices + 2 * indexBuffer.itemSize, indexBuffer.itemSize);
+            assert(i0 < static_cast<uint32_t>(vertexCount)
+                   && i1 < static_cast<uint32_t>(vertexCount)
+                   && i2 < static_cast<uint32_t>(vertexCount)
+                   && "Index references vertex outside the bound vertex buffer");
+
+            binTriangle(triangle, vertexBuffer.buffPtr + i0 * vertexBuffer.itemSize,
+                        vertexBuffer.buffPtr + i1 * vertexBuffer.itemSize,
+                        vertexBuffer.buffPtr + i2 * vertexBuffer.itemSize, tilesX, tilesY);
         }
-
-        const AABB triAABB = computeTriangleAABB(tv1.first, tv2.first, tv3.first);
-
-        // Frustum cull
-        if (!checkAABBIntersect(renderTargetDimensions, triAABB))
+    }
+    else
+    {
+        for (int triangle = 0; triangle < totalTriangles; ++triangle)
         {
-            cachedTriangles[t].valid = false;
-            continue;
-        }
-
-        // Cache the transformed triangle
-        const int nAttrs = static_cast<int>(tv1.second.size());
-        assert(nAttrs <= ARDUGL_MAX_ATTRS && "Increase ARDUGL_MAX_ATTRS");
-        cachedTriangles[t].valid = true;
-        cachedTriangles[t].sv[0] = tv1.first;
-        cachedTriangles[t].sv[1] = tv2.first;
-        cachedTriangles[t].sv[2] = tv3.first;
-        cachedTriangles[t].numAttrs = nAttrs;
-        for (int a = 0; a < nAttrs; ++a)
-        {
-            cachedTriangles[t].attrs[0][a] = tv1.second[a];
-            cachedTriangles[t].attrs[1][a] = tv2.second[a];
-            cachedTriangles[t].attrs[2][a] = tv3.second[a];
-        }
-        // Bin into overlapping tiles
-        for (int ty = 0; ty < tilesY; ++ty)
-        {
-            for (int tx = 0; tx < tilesX; ++tx)
-            {
-                // Tile AABB in screen space (Y-up)
-                const float tileBlX = static_cast<float>(tx * ARDUGL_TILE_W);
-                const float tileBlY = static_cast<float>(ty * ARDUGL_TILE_H);
-                const AABB tileAABB{ .blX = tileBlX,
-                                     .blY = tileBlY,
-                                     .width = static_cast<float>(ARDUGL_TILE_W),
-                                     .height = static_cast<float>(ARDUGL_TILE_H) };
-
-                if (!checkAABBIntersect(triAABB, tileAABB))
-                    continue;
-
-                const int tileIdx = ty * tilesX + tx;
-                if (tileBinCount[tileIdx] < ARDUGL_MAX_TRIS_PER_TILE)
-                {
-                    tileBins[tileIdx][tileBinCount[tileIdx]++] = static_cast<uint16_t>(t);
-                }
-            }
+            const char *base = vertexBuffer.buffPtr + triangle * 3 * vertexBuffer.itemSize;
+            binTriangle(triangle, base, base + vertexBuffer.itemSize,
+                        base + 2 * vertexBuffer.itemSize, tilesX, tilesY);
         }
     }
 
