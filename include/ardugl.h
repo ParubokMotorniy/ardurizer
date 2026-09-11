@@ -31,15 +31,14 @@ class Adafruit_ST7789;
 #endif
 
 // Maximum number of triangles that can be binned per tile.
-// Each entry is one uint16_t triangle index → 2 bytes each.
-// tileBins[ARDUGL_MAX_TILES][ARDUGL_MAX_TRIS_PER_TILE] × 2 bytes must fit in SRAM.
-// At 135 tiles × 12 entries: 135 × 12 × 2 = 3 240 bytes.
+// Each entry is one uint8_t triangle index → 1 byte each.
+// tileBins[ARDUGL_MAX_TILES][ARDUGL_MAX_TRIS_PER_TILE] must fit in SRAM.
+// At 30 tiles × 10 entries: 300 bytes.
 #ifndef ARDUGL_MAX_TRIS_PER_TILE
 #define ARDUGL_MAX_TRIS_PER_TILE 10
 #endif
 
-// Maximum total triangles per frame (= vertex buffer capacity / 3).
-// The cube has 36 triangles; 48 gives a comfortable margin.
+// Maximum total triangles per frame (= primitive buffer capacity / 3).
 #ifndef ARDUGL_MAX_TRIANGLES
 #define ARDUGL_MAX_TRIANGLES 60
 #endif
@@ -82,6 +81,7 @@ namespace ArduGL
 enum BufferType
 {
     BT_VertexAttribute,
+    BT_VertexIndex
 };
 
 enum ShaderType
@@ -118,6 +118,10 @@ void setClearColor(float r, float g, float b);
 /// buffSize — total size in bytes
 /// itemSize — size of one vertex in bytes
 ReturnInfo bindVertexBuffer(const char *buffPtr, int buffSize, int itemSize);
+
+/// Bind an optional index buffer. Index elements may be 8, 16, or 32 bits.
+/// Passing nullptr disables indexed rendering and restores non-indexed input.
+ReturnInfo bindIndexBuffer(const char *buffPtr, int buffSize, int itemSize);
 
 /// Set the render-target size in pixels (e.g. 240 × 135).
 ReturnInfo setRenderTargetDimensions(int width, int height);
