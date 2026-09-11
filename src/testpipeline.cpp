@@ -51,29 +51,65 @@ Adafruit_ST7789 tft = Adafruit_ST7789(/*CS*/ 10, /*DC*/ 9, 11, 13);
 using VertexShaderOutput
     = std::pair<glm::vec4 /*view space vertex*/,
                 std::vector<float> /*attributes to be passed down the pipeline*/>;
-VertexShaderOutput cubeVertexShader(const char *rawVertex /*vertex data from buffer*/)
+VertexShaderOutput bunnyVertexShader(const char *rawVertex /*vertex data from buffer*/)
 {
     const Vertex *vertex = reinterpret_cast<const Vertex *>(rawVertex);
 
-    const glm::vec3 *vertexPos = &vertex->position;
-    const glm::vec3 *vertexColor = &vertex->color;
-    const glm::vec3 *vertexNormal = &vertex->normal;
-    const glm::vec4 worldPos = currentModelMatrix
-                               * glm::vec4(vertexPos->x, vertexPos->y, vertexPos->z, 1.0);
-    const glm::vec4 transformedPos = proj * view * worldPos;
+    const glm::vec3 &vertexPos = vertex->position;
+    const glm::vec3 &vertexColor = vertex->color;
+    const glm::vec3 &vertexNormal = vertex->normal;
 
-    // TODO: properly transforn normals
-    return std::make_pair(transformedPos,
-                          std::vector<float>{ vertexColor->x, vertexColor->y, vertexColor->z,
-                                              vertexNormal->x, vertexNormal->y, vertexNormal->z });
+    const glm::vec4 worldPos4 = currentModelMatrix * glm::vec4(vertexPos, 1.0f);
+    const glm::vec3 worldPos{ worldPos4 };
+
+    const glm::vec4 clipPos = proj * view * worldPos4;
+
+    const glm::mat3 normalMatrix = glm::transpose(glm::inverse(glm::mat3(currentModelMatrix)));
+    const glm::vec3 worldNormal = glm::normalize(normalMatrix * vertexNormal);
+
+    return std::make_pair(clipPos, std::vector<float>{ vertexColor.x, vertexColor.y, vertexColor.z,
+                                                       worldNormal.x, worldNormal.y, worldNormal.z,
+                                                       worldPos.x, worldPos.y, worldPos.z });
 }
 
-glm::vec3 cubeFragmentShader(const std::vector<float> &interpolatedAttributes)
+glm::vec3 bunnyFragmentShader(const std::vector<float> &interpolatedAttributes)
 {
-    // TODO: add more complex shading, e.g. basic blinn-phong
-    assert(interpolatedAttributes.size() == 6);
-    return glm::vec3{ interpolatedAttributes[0], interpolatedAttributes[1],
-                      interpolatedAttributes[2] };
+    assert(interpolatedAttributes.size() == 9);
+
+    constexpr glm::vec3 lightPos{ 3.0f, 5.0f, -3.0f };
+    constexpr glm::vec3 lightColor{ 1.0f, 0.95f, 0.85f };
+    constexpr glm::vec3 viewPos{ 0.0f, 0.0f, 5.0f }; // camera at +5 z (view translates -5)
+    constexpr float ambientStrength = 0.15f;
+    constexpr float specularStrength = 0.5f;
+    constexpr float shininess = 32.0f;
+
+    // Unpack  attributes
+    const glm::vec3 baseColor{ interpolatedAttributes[0], interpolatedAttributes[1],
+                               interpolatedAttributes[2] };
+    const glm::vec3 normal = glm::normalize(glm::vec3{
+        interpolatedAttributes[3], interpolatedAttributes[4], interpolatedAttributes[5] });
+    const glm::vec3 fragPos{ interpolatedAttributes[6], interpolatedAttributes[7],
+                             interpolatedAttributes[8] };
+
+    // Lighting vector
+    const glm::vec3 lightDir = glm::normalize(lightPos - fragPos);
+    const glm::vec3 viewDir = glm::normalize(viewPos - fragPos);
+    const glm::vec3 halfway = glm::normalize(lightDir + viewDir);
+
+    // Ambient
+    const glm::vec3 ambient = ambientStrength * lightColor;
+
+    // Diffuse
+    const float diff = glm::max(glm::dot(normal, lightDir), 0.0f);
+    const glm::vec3 diffuse = diff * lightColor;
+
+    // Specular
+    const float spec = glm::pow(glm::max(glm::dot(normal, halfway), 0.0f), shininess);
+    const glm::vec3 specular = specularStrength * spec * lightColor;
+
+    glm::vec3 result = (ambient + diffuse) * baseColor + specular;
+
+    return glm::clamp(result, 0.0f, 1.0f);
 }
 
 void initializePipeline()
@@ -82,12 +118,12 @@ void initializePipeline()
                              sizeof(Vertex));
     ArduGL::bindIndexBuffer(reinterpret_cast<const char *>(indexBuffer), indexBufferSize,
                             sizeof(uint16_t));
-    ArduGL::bindShader(ArduGL::ShaderType::ST_Vertex, reinterpret_cast<void *>(&cubeVertexShader));
+    ArduGL::bindShader(ArduGL::ShaderType::ST_Vertex, reinterpret_cast<void *>(&bunnyVertexShader));
     ArduGL::bindShader(ArduGL::ShaderType::ST_Fragment,
-                       reinterpret_cast<void *>(&cubeFragmentShader));
+                       reinterpret_cast<void *>(&bunnyFragmentShader));
 
     ArduGL::setRenderTargetDimensions(fullScreenWidth, fullScreenHeight);
-    ArduGL::setClearColor(0.2f, 0.7f, 0.65f);
+    ArduGL::setClearColor(0.1f, 0.1f, 0.1f);
 
 #if ARDUGL_USE_HW_SPI_ASYNC
     ArduGL::initTiledPipeline(/*csPin=*/10, /*dcPin=*/9);

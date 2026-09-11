@@ -40,7 +40,7 @@ class Adafruit_ST7789;
 
 // Maximum total triangles per frame (= primitive buffer capacity / 3).
 #ifndef ARDUGL_MAX_TRIANGLES
-#define ARDUGL_MAX_TRIANGLES 60
+#define ARDUGL_MAX_TRIANGLES 65
 #endif
 
 // Maximum number of tiles (tilesX * tilesY).
@@ -55,7 +55,7 @@ class Adafruit_ST7789;
 // CachedTriangle size = 3×vec4 + 3×ARDUGL_MAX_ATTRS×float + 1 bool
 //   = 48 + 3×8×4 + 4 = 148 bytes × 48 triangles = 7 104 bytes.
 #ifndef ARDUGL_MAX_ATTRS
-#define ARDUGL_MAX_ATTRS 6
+#define ARDUGL_MAX_ATTRS 9
 #endif
 
 // Async FSP SPI clock. The 16-bit pixel path uses one interrupt per pixel.
