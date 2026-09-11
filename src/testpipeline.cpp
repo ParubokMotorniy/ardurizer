@@ -22,8 +22,6 @@ namespace
 constexpr int fullScreenWidth = 7 * 32;
 constexpr int fullScreenHeight = 4 * 32;
 
-// TODO: adding indexed meshes would be sick AND quite obligatory, to be honest
-
 glm::mat4 proj = glm::perspective(glm::radians(45.0),
                                   (double)fullScreenWidth / (double)fullScreenHeight, 0.1, 1000.0);
 glm::mat4 view = glm::translate(glm::mat4(1.0), glm::vec3(0.0, 0.0, -5.0));
@@ -82,6 +80,8 @@ void initializePipeline()
 {
     ArduGL::bindVertexBuffer(reinterpret_cast<const char *>(vertexBuffer), vertexBufferSize,
                              sizeof(Vertex));
+    ArduGL::bindIndexBuffer(reinterpret_cast<const char *>(indexBuffer), indexBufferSize,
+                            sizeof(uint16_t));
     ArduGL::bindShader(ArduGL::ShaderType::ST_Vertex, reinterpret_cast<void *>(&cubeVertexShader));
     ArduGL::bindShader(ArduGL::ShaderType::ST_Fragment,
                        reinterpret_cast<void *>(&cubeFragmentShader));
