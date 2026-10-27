@@ -18,3 +18,14 @@ Buffer size: 3,8 KiB (0.12 of RAM);
 <img width="600" height="330" alt="test_all_en_color" src="https://github.com/user-attachments/assets/dee68f2f-2543-4b4c-b079-a125c5584dbf" />
 
 ---
+
+Demo with a colorful indexed Stanford bunny featuring basic Blinn-Phong shading:
+
+
+https://github.com/user-attachments/assets/634e2ff1-3dcd-47d1-be84-da1efbdf56b5
+
+
+
+
+
+
